@@ -346,26 +346,42 @@ export default function ExcelConverter() {
   const applyMapping = useCallback((mappings, currentColumns) => {
     if (!Array.isArray(mappings) || mappings.length === 0) return;
 
-    // Build a quick map: sourceColumnName → mapping entry
+    // Build a quick map from BOTH originalName and displayName to mapping entry.
+    // This way Claude can return either the source name OR the current display
+    // name and we still find the right column.
     const bySource = {};
     mappings.forEach(m => {
-      if (m.source) bySource[String(m.source).trim().toLowerCase()] = m;
+      if (m.source) {
+        bySource[String(m.source).trim().toLowerCase()] = m;
+      }
     });
+    const findMapping = (col) => {
+      const byOriginal = bySource[String(col.originalName).trim().toLowerCase()];
+      if (byOriginal) return byOriginal;
+      const byDisplay = bySource[String(col.displayName).trim().toLowerCase()];
+      return byDisplay || null;
+    };
 
-    // Update each column: if its source name matches a mapping, select+rename it
+    // Update each column. If matched: select + rename to target name.
+    // If NOT matched: untick AND reset displayName back to originalName so a
+    // stale rename from a previous match doesn't linger.
     const updated = currentColumns.map(c => {
-      const m = bySource[String(c.originalName).trim().toLowerCase()];
+      const m = findMapping(c);
       if (m) {
         return { ...c, selected: true, displayName: m.target };
       }
-      return { ...c, selected: false };
+      return { ...c, selected: false, displayName: c.originalName };
     });
 
     // Build new outputOrder: target order first (only mapped ones), then unmapped at end
     const targetToSourceColId = {};
     mappings.forEach(m => {
       if (!m.source) return;
-      const col = updated.find(c => c.originalName.toLowerCase() === String(m.source).trim().toLowerCase());
+      const col = updated.find(c =>
+        c.originalName.toLowerCase() === String(m.source).trim().toLowerCase() ||
+        c.displayName.toLowerCase() === String(m.source).trim().toLowerCase() ||
+        c.displayName.toLowerCase() === String(m.target).trim().toLowerCase()
+      );
       if (col) targetToSourceColId[m.target] = col.id;
     });
     const orderedIds = mappings
@@ -378,7 +394,7 @@ export default function ExcelConverter() {
     // Build a per-column mapping lookup for confidence pills
     const mapLookup = {};
     updated.forEach(c => {
-      const m = bySource[String(c.originalName).trim().toLowerCase()];
+      const m = findMapping(c);
       if (m) mapLookup[c.id] = m;
     });
 

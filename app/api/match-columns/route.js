@@ -40,6 +40,8 @@ ${JSON.stringify(targetColumns)}
 For each TARGET column, pick the BEST matching source column (or null if there is no good match).
 Use both the column names AND the sample values to decide. For example, if target is "Date of Birth" and a source column has values like "5/20/85" or "1985-05-20", that is a strong match even if the source name is "DOB_RAW" or "patient_dob".
 
+CRITICAL: In the "source" field of your response, use the EXACT source column name as given above (e.g. "PT_FNAME"), even if it looks ugly or abbreviated. Do NOT rename it. Do NOT use the target name in the source field. The "source" must match a name from the SOURCE list verbatim, character for character.
+
 Confidence rubric:
   high (0.9-1.0): unmistakable match (e.g. "PT_FNAME" → "First Name")
   medium (0.6-0.89): likely correct based on name or values, but worth confirming
@@ -54,7 +56,8 @@ Return ONLY a JSON object in this exact shape, no preamble or markdown:
   ]
 }
 
-Every target column must have an entry, in the same order as the TARGET list above.`;
+Every target column must have an entry, in the same order as the TARGET list above.
+Each "source" value must EXACTLY match one of the SOURCE column names above (or be null).`;
 
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
