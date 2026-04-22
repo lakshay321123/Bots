@@ -258,14 +258,21 @@ export default function ExcelConverter() {
 
   useEffect(() => { loadTemplates(); }, [loadTemplates]);
 
-  // Keep outputOrder in sync with columns: add any new col ids, drop any that no longer exist
+  // Keep outputOrder in sync with columns: add any new col ids, drop any that no longer exist.
+  // IMPORTANT: never reshuffle the order if the set of ids hasn't changed — the order may
+  // have been carefully arranged (e.g. by AI auto-match to follow target file order).
   useEffect(() => {
     if (columns.length === 0) return;
     const colIds = columns.map(c => c.id);
+    const colIdSet = new Set(colIds);
     setOutputOrder(prev => {
-      const kept = prev.filter(id => colIds.includes(id));
-      const missing = colIds.filter(id => !kept.includes(id));
-      if (missing.length === 0 && kept.length === prev.length) return prev;
+      const prevSet = new Set(prev);
+      // Same set of ids? Don't touch order at all.
+      if (prev.length === colIds.length && prev.every(id => colIdSet.has(id))) {
+        return prev;
+      }
+      const kept = prev.filter(id => colIdSet.has(id));
+      const missing = colIds.filter(id => !prevSet.has(id));
       return [...kept, ...missing];
     });
   }, [columns]);
@@ -654,11 +661,14 @@ export default function ExcelConverter() {
     const selectedIds = columns.filter(c => c.selected).map(c => c.id);
     if (selectedIds.length === 0) { setError('Tick at least one column first.'); return; }
     if (effectivelySelectedRows.length === 0) { setError('No rows match your filters and selections.'); return; }
-    const newOrder = [
-      ...outputOrder.filter(id => selectedIds.includes(id)),
-      ...selectedIds.filter(id => !outputOrder.includes(id)),
-    ];
-    setOutputOrder(newOrder);
+    // Preserve the existing outputOrder (which may have been set by AI auto-match
+    // to follow the target file's column order). Only append IDs that genuinely
+    // don't appear in outputOrder yet (which should never happen since the
+    // sync effect keeps them in step, but defensive).
+    const missing = selectedIds.filter(id => !outputOrder.includes(id));
+    if (missing.length > 0) {
+      setOutputOrder([...outputOrder, ...missing]);
+    }
     setStep('preview');
     setError('');
   };
