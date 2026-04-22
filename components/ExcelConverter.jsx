@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import {
   Upload, Download, Sparkles, RotateCcw, FileSpreadsheet,
@@ -200,6 +200,110 @@ async function readFileAsText(file) {
   return new TextDecoder('utf-8').decode(buf);
 }
 
+// Resize handle — drag to adjust the table height.
+// Calls onResize(absoluteHeight) where absoluteHeight = startHeight + deltaY
+// Height bounds for the resizable table — also used as ARIA min/max
+// on the resize separator so screen readers announce the range.
+const TABLE_HEIGHT_MIN = 240;
+const TABLE_HEIGHT_MAX = 1400;
+
+function ResizeHandle({ currentHeight, getStartHeight, onResize, min = TABLE_HEIGHT_MIN, max = TABLE_HEIGHT_MAX }) {
+  // Visible focus ring is a separate state instead of relying on :focus-visible
+  // CSS — this component uses inline styles, so toggling React state is the
+  // cleanest way to give keyboard users a visible focus indicator without
+  // adding a global stylesheet.
+  const [hasFocus, setHasFocus] = useState(false);
+  // Keep a reference to the active drag's cleanup function so we can
+  // invoke it if the component unmounts mid-drag (prevents document.body
+  // from getting stuck with ns-resize cursor and no text selection).
+  const cleanupRef = useRef(() => {});
+  useEffect(() => () => cleanupRef.current(), []);
+
+  const startDrag = (e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = getStartHeight();
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    const onMove = (ev) => onResize(startHeight + (ev.clientY - startY));
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', cleanup);
+      window.removeEventListener('pointercancel', cleanup);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      cleanupRef.current = () => {};
+    };
+    cleanupRef.current = cleanup;
+    // setPointerCapture routes subsequent pointer events to this element
+    // even if the pointer leaves the browser window (fixes stuck-state bug)
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch {}
+    document.body.style.cursor = 'ns-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', cleanup, { once: true });
+    window.addEventListener('pointercancel', cleanup, { once: true });
+  };
+
+  const handleKeyDown = (e) => {
+    // Keyboard accessibility — Arrow keys nudge, Page keys jump, Home/End extremes
+    const step = e.shiftKey ? 48 : 24;
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      onResize(getStartHeight() - step);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      onResize(getStartHeight() + step);
+    } else if (e.key === 'PageUp') {
+      e.preventDefault();
+      onResize(getStartHeight() - 120);
+    } else if (e.key === 'PageDown') {
+      e.preventDefault();
+      onResize(getStartHeight() + 120);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      onResize(min);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      onResize(max);
+    }
+  };
+
+  return (
+    <div
+      role="separator"
+      aria-label="Resize table height"
+      aria-orientation="horizontal"
+      aria-valuenow={currentHeight}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      onPointerDown={startDrag}
+      onKeyDown={handleKeyDown}
+      onFocus={() => setHasFocus(true)}
+      onBlur={() => setHasFocus(false)}
+      title="Drag to resize the table (or use arrow keys, Home/End for min/max)"
+      style={{
+        height: '8px',
+        cursor: 'ns-resize',
+        // Keyboard focus indicator: a 2px cyan inset shadow so the user can
+        // see which element has focus. Inline so we don't need a stylesheet.
+        background: hasFocus ? '#D6EBF2' : '#F5F7F8',
+        borderTop: '0.5px solid #E6E6E6',
+        borderBottom: '0.5px solid #E6E6E6',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        touchAction: 'none',
+        outline: hasFocus ? '2px solid #00B5D6' : 'none',
+        outlineOffset: '-2px',
+      }}
+    >
+      <div style={{ width: '40px', height: '3px', background: hasFocus ? '#00B5D6' : '#CCCCCC', borderRadius: '2px' }} />
+    </div>
+  );
+}
+
 export default function ExcelConverter() {
   const [fileName, setFileName] = useState('');
   const [columns, setColumns] = useState([]);
@@ -220,6 +324,22 @@ export default function ExcelConverter() {
   const [rawSheetData, setRawSheetData] = useState([]);    // raw rows incl. pre-header noise
   const [headerRowIndex, setHeaderRowIndex] = useState(0); // which row is the header (0-based)
   const [fileSizeWarning, setFileSizeWarning] = useState('');
+  const [tableHeight, setTableHeight] = useState(520); // user-resizable; pixels
+  // Is the viewport narrow enough that we should stack the landing preview cards?
+  const [isNarrow, setIsNarrow] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 768px)');
+    const update = () => setIsNarrow(mq.matches);
+    update();
+    if (mq.addEventListener) {
+      mq.addEventListener('change', update);
+      return () => mq.removeEventListener('change', update);
+    }
+    // Safari < 14 fallback
+    mq.addListener(update);
+    return () => mq.removeListener(update);
+  }, []);
 
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
@@ -332,6 +452,13 @@ export default function ExcelConverter() {
     setHeaderRowIndex(newIdx);
     rebuildFromMatrix(rawSheetData, newIdx);
   }, [rawSheetData, rebuildFromMatrix]);
+
+  // Resize handle: clamp between 240 and 1400 px so it always stays usable
+  const handleTableResize = useCallback((newHeight) => {
+    if (newHeight < TABLE_HEIGHT_MIN) newHeight = TABLE_HEIGHT_MIN;
+    if (newHeight > TABLE_HEIGHT_MAX) newHeight = TABLE_HEIGHT_MAX;
+    setTableHeight(newHeight);
+  }, []);
 
   const handleFileUpload = useCallback(async (e) => {
     const file = e.target.files && e.target.files[0];
@@ -751,7 +878,7 @@ Return only the JSON array.`;
         </div>
 
         {!hasData && (
-          <div style={{ padding: '48px 24px' }}>
+          <div style={{ padding: '40px 24px 48px' }}>
             <label
               style={{ display: 'block', maxWidth: '520px', margin: '0 auto', padding: '44px 24px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s' }}
               onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
@@ -762,8 +889,107 @@ Return only the JSON array.`;
               <p style={{ fontSize: '13px', color: BRAND.grayDark, margin: 0 }}>or click to browse · .xlsx, .xls, .csv</p>
               <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} style={{ display: 'none' }} />
             </label>
+
+            {/* Sample input → output preview */}
+            <div style={{ maxWidth: '1100px', margin: '40px auto 0' }}>
+              <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>What Zeus does</p>
+              <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+                {/* Input side */}
+                <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.grayLight}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+                  <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div>
+                      <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample input</p>
+                      <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export.xlsx</p>
+                    </div>
+                    <span style={{ fontSize: '10px', color: BRAND.grayDark }}>5 cols · messy</span>
+                  </div>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%', fontFamily: 'ui-monospace, monospace' }}>
+                      <thead>
+                        <tr>
+                          {['PT_FNAME', 'PT_LNAME', 'DOB_RAW', 'MRN_ID', '_temp'].map(h => (
+                            <th key={h} style={{ background: BRAND.surface, padding: '6px 8px', textAlign: 'left', color: BRAND.grayDark, fontWeight: 500, fontSize: '10px', borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap' }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[
+                          ['john', 'CASTILLO', '5/20/85', 'a12345', '---'],
+                          ['MARIA', 'lopez', '11-3-72', 'A98102', 'x'],
+                          ['David ', ' Chen', '02/14/90', ' a33871', ''],
+                          ['Priya', 'PATEL', '7/22/88', 'A55019', 'NULL'],
+                          ['', 'Williams', '9/15/65', 'a71234', ''],
+                        ].map((row, i) => (
+                          <tr key={i}>
+                            {row.map((cell, j) => (
+                              <td key={j} style={{ padding: '5px 8px', color: BRAND.grayDark, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px' }}>
+                                {cell || <span style={{ color: BRAND.grayMid }}>—</span>}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Arrow — rotates 90° when the grid stacks vertically */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
+                  <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: BRAND.cyan, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
+                    <ArrowRight size={16} />
+                  </div>
+                </div>
+
+                {/* Output side */}
+                <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.cyan}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 2px 8px rgba(0, 181, 214, 0.12)' }}>
+                  <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div>
+                      <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample output</p>
+                      <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export_zeus_output.xlsx</p>
+                    </div>
+                    <span style={{ fontSize: '10px', color: BRAND.cyan, fontWeight: 500 }}>4 cols · clean</span>
+                  </div>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%' }}>
+                      <thead>
+                        <tr>
+                          {['First Name', 'Last Name', 'Date of Birth', 'MRN'].map(h => (
+                            <th key={h} style={{ background: BRAND.cyan, padding: '6px 8px', textAlign: 'left', color: 'white', fontWeight: 500, fontSize: '10px', whiteSpace: 'nowrap' }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[
+                          ['John', 'Castillo', '1985-05-20', 'A12345'],
+                          ['Maria', 'Lopez', '1972-11-03', 'A98102'],
+                          ['David', 'Chen', '1990-02-14', 'A33871'],
+                          ['Priya', 'Patel', '1988-07-22', 'A55019'],
+                        ].map((row, i) => (
+                          <tr key={i}>
+                            {row.map((cell, j) => (
+                              <td key={j} style={{ padding: '5px 8px', color: BRAND.black, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px', fontFamily: j === 2 || j === 3 ? 'ui-monospace, monospace' : 'inherit' }}>
+                                {cell}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'center', gap: '24px', flexWrap: 'wrap', fontSize: '11px', color: BRAND.grayDark }}>
+                <span>✓ Renamed: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>PT_FNAME → First Name</code></span>
+                <span>✓ Dates: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>5/20/85 → 1985-05-20</code></span>
+                <span>✓ Trimmed whitespace</span>
+                <span>✓ Dropped junk column <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>_temp</code></span>
+                <span>✓ Filtered row missing first name</span>
+              </div>
+            </div>
+
             {templates.length > 0 && (
-              <div style={{ maxWidth: '520px', margin: '24px auto 0' }}>
+              <div style={{ maxWidth: '520px', margin: '32px auto 0' }}>
                 <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 10px', letterSpacing: '0.5px', textTransform: 'uppercase' }}>Your saved templates</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                   {templates.slice(0, 5).map(t => (
@@ -991,7 +1217,7 @@ Return only the JSON array.`;
               </div>
             )}
 
-            <div style={{ overflowX: 'auto', maxHeight: '55vh', overflowY: 'auto', background: BRAND.white }}>
+            <div style={{ overflowX: 'auto', height: `${tableHeight}px`, overflowY: 'auto', background: BRAND.white }}>
               <table style={{ borderCollapse: 'separate', borderSpacing: 0, fontSize: '11px', fontFamily: 'inherit' }}>
                 <thead>
                   <tr style={{ height: '36px' }}>
@@ -1072,6 +1298,8 @@ Return only the JSON array.`;
               </table>
             </div>
 
+            <ResizeHandle currentHeight={tableHeight} getStartHeight={() => tableHeight} onResize={handleTableResize} />
+
             {rows.length > 100 && (
               <div style={{ padding: '8px 20px', background: BRAND.cyanLight + '80', borderTop: `0.5px solid ${BRAND.grayLight}`, fontSize: '11px', color: BRAND.grayDark, textAlign: 'center' }}>
                 Showing first 100 of {rows.length.toLocaleString()} rows · all matching rows flow through
@@ -1135,7 +1363,7 @@ Return only the JSON array.`;
               </div>
             </div>
 
-            <div style={{ overflowX: 'auto', maxHeight: '55vh', overflowY: 'auto', background: BRAND.white }}>
+            <div style={{ overflowX: 'auto', height: `${tableHeight}px`, overflowY: 'auto', background: BRAND.white }}>
               <table style={{ borderCollapse: 'collapse', fontSize: '11px', fontFamily: 'inherit' }}>
                 <thead>
                   <tr>
@@ -1166,6 +1394,8 @@ Return only the JSON array.`;
                 </tbody>
               </table>
             </div>
+
+            <ResizeHandle currentHeight={tableHeight} getStartHeight={() => tableHeight} onResize={handleTableResize} />
 
             {effectivelySelectedRows.length > 100 && (
               <div style={{ padding: '8px 20px', background: BRAND.cyanLight + '80', borderTop: `0.5px solid ${BRAND.grayLight}`, fontSize: '11px', color: BRAND.grayDark, textAlign: 'center' }}>
