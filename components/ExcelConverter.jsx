@@ -347,6 +347,12 @@ export default function ExcelConverter() {
   const [targetFileName, setTargetFileName] = useState('');
   const [columnMapping, setColumnMapping] = useState({});  // { sourceColId: { target, confidence, reason } }
   const [mappingLoading, setMappingLoading] = useState(false);
+  // In two-file mode, Page 1 defaults to showing only the AI-mapped columns so
+  // the user isn't overwhelmed by 30+ deselected source columns. Flip this on
+  // via the toolbar toggle to reveal everything for manual override.
+  // In one-file mode this is ignored — Page 1 always shows every source column
+  // because that mode exists specifically for manual editing.
+  const [showAllInPick, setShowAllInPick] = useState(false);
   // Tracks which match request is currently in-flight so stale responses
   // (from earlier clicks or sheet switches) can be ignored.
   const matchRequestIdRef = useRef(0);
@@ -1068,16 +1074,26 @@ Return only the JSON array.`;
     setRawSheetData([]); setHeaderRowIndex(0); setFileSizeWarning('');
     setMode(null); setTargetColumns([]); setTargetFileName('');
     setColumnMapping({}); setMappingLoading(false);
+    setShowAllInPick(false);
   };
 
   const selectedColCount = columns.filter(c => c.selected).length;
   const selectedRowsRaw = rows.filter(r => r.selected);
   const hasData = columns.length > 0;
   const displayRows = rows.slice(0, 100);
-  // Page 1: render ALL columns in outputOrder (selected or not; unselected shown dimmed)
-  const pickCols = outputOrder.map(id => columns.find(c => c.id === id)).filter(Boolean);
+  // Page 1 column list.
+  //   one-file mode: show everything (manual editing is the whole point)
+  //   two-file mode: show only the AI-mapped / selected columns by default;
+  //                  user can toggle showAllInPick to reveal the 30+ deselected
+  //                  source columns if they want to manually tick one back in.
+  const allPickCols = outputOrder.map(id => columns.find(c => c.id === id)).filter(Boolean);
+  const pickCols = (mode === 'two-file' && !showAllInPick)
+    ? allPickCols.filter(c => c.selected || columnMapping[c.id])
+    : allPickCols;
+  // How many source columns are currently hidden from Page 1 (for the toggle label)
+  const hiddenPickCount = allPickCols.length - pickCols.length;
   // Page 2: only selected columns in outputOrder — this is the final file
-  const outputCols = pickCols.filter(c => c.selected);
+  const outputCols = allPickCols.filter(c => c.selected);
   const outputBaseName = fileName.replace(/\.(xlsx|xls|csv)$/i, '');
   const currentTemplate = currentTemplateId ? templates.find(t => t.id === currentTemplateId) : null;
   const filteredRowCount = rowsPassingFilters ? rowsPassingFilters.size : rows.length;
@@ -1579,6 +1595,19 @@ Return only the JSON array.`;
               <button onClick={() => setShowFilters(s => !s)} style={{ background: showFilters ? BRAND.cyanLight : 'transparent', border: 'none', color: BRAND.cyan, fontSize: '11px', fontWeight: 500, cursor: 'pointer', padding: showFilters ? '3px 8px' : 0, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <FilterIcon size={12} />Filter rows {filterRules.length > 0 && `· ${filterRules.length}`}
               </button>
+              {mode === 'two-file' && (hiddenPickCount > 0 || showAllInPick) && (
+                <button
+                  onClick={() => setShowAllInPick(v => !v)}
+                  style={{ background: showAllInPick ? BRAND.cyanLight : 'transparent', border: 'none', color: BRAND.cyan, fontSize: '11px', fontWeight: 500, cursor: 'pointer', padding: showAllInPick ? '3px 8px' : 0, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                  title={showAllInPick
+                    ? 'Hide the unmapped source columns and focus on the mapping only'
+                    : `Show the ${hiddenPickCount} source column${hiddenPickCount === 1 ? '' : 's'} that Claude didn't map so you can tick one in manually`}
+                >
+                  {showAllInPick
+                    ? <>Hide unmapped · focus on mapping</>
+                    : <>Show {hiddenPickCount} unmapped source column{hiddenPickCount === 1 ? '' : 's'}</>}
+                </button>
+              )}
               <span style={{ marginLeft: 'auto', fontSize: '11px', color: BRAND.grayDark }}>Tip: click name to rename · use arrows to reorder columns</span>
             </div>
 
