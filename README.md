@@ -1,58 +1,65 @@
-# Zeus File Converter — by Cosentus
+# Zeus by Cosentus — File Converter
 
-Excel → Excel converter for healthcare RCM workflows. Pick columns + rows, rename headers, save as a reusable template, AI-assist with healthcare-standard names.
+Intelligent file conversion for healthcare RCM. Turn messy exports from any EHR into the format your billing team needs. Build a template once, run it 10,000 times.
 
-Part of the **Zeus** suite running on the **MedCloud** platform.
+## Routes
+
+| Path | Status | What it does |
+|------|--------|--------------|
+| `/` | ✅ Live | Landing page — hero animation, value props, CTA |
+| `/excel-to-excel` | ✅ Live | The full converter (column + row selection, templates, AI rename) |
+| `/excel-to-pdf` | 🔜 Soon | Excel → PDF report generator |
+| `/pdf-to-excel` | 🔜 Soon | OCR-driven PDF → structured spreadsheet |
+| `/image-to-excel` | 🔜 Soon | OCR-driven image → spreadsheet |
 
 ## Stack
 
-- Next.js 14 (App Router)
-- React 18
-- SheetJS (xlsx) for spreadsheet parsing
+- Next.js 14 App Router · React 18
+- SheetJS for Excel parsing (browser-side)
+- Anthropic Claude Sonnet 4.5 (server-proxied) for column rename suggestions
 - lucide-react icons
-- Anthropic API (server-side) for column rename suggestions
-- `localStorage` for template persistence (will move to Supabase in v4)
+- `localStorage` for template persistence (Supabase migration planned)
 
 ## Local development
 
 ```bash
 npm install
-cp .env.example .env.local
-# add your ANTHROPIC_API_KEY to .env.local
+cp .env.example .env.local       # add your ANTHROPIC_API_KEY
 npm run dev
 ```
 
-Open http://localhost:3000.
+App runs at http://localhost:3000.
 
-## Deploy to Vercel
+## Deploy
 
-1. Push to GitHub
-2. Import the repo in Vercel
-3. Add `ANTHROPIC_API_KEY` in Project Settings → Environment Variables
-4. Deploy
+Hosted on Vercel. Push to `main` triggers a deploy. Required env var:
 
-## Features
+- `ANTHROPIC_API_KEY` — set in Vercel → Project Settings → Environment Variables
 
-**v3 (current)**
-- Upload Excel/CSV, preview as spreadsheet grid
-- Tick columns AND rows to keep
-- Rename column headers inline
-- Column profiling: data type, % empty, unique count
-- Row filter rules (10 operators, AND-combined)
-- Save / load / auto-detect templates by column signature
-- Two-step Pick → Preview flow with column reorder
-- AI rename via Claude Sonnet 4.5
-- Before/after summary
-- Download cleaned `.xlsx`
+## Project structure
 
-**Roadmap (v4+)**
-- Supabase persistence (multi-user templates, audit log, RBAC)
-- Combine / split / format-transform column actions
-- Validation rules (NPI Luhn, regex, required) + review queue
-- Template versioning + approval workflow
-- Client-level template scoping
-- API endpoint for RPA / orchestrator integration
-- PDF-to-Excel and Image-to-Excel converters as sibling routes
+```
+app/
+├── layout.jsx                    Root layout, fonts, metadata
+├── globals.css                   Brand variables, animations, reset
+├── page.jsx                      Landing page (/)
+├── excel-to-excel/page.jsx       Converter (/excel-to-excel)
+└── api/suggest-names/route.js    Server proxy → Anthropic API
+components/
+├── Header.jsx                    Top nav with tabs + Cosentus logo
+├── Footer.jsx                    Cosentus division attribution
+├── AppShell.jsx                  Header + main + footer wrapper
+├── HeroAnimation.jsx             Animated SVG: messy → Zeus → clean
+└── ExcelConverter.jsx            The full converter component
+public/
+├── cosentus-logo.png             Horizontal lockup (header)
+├── cosentus-mark.png             Lion mark (small spaces)
+└── favicon.png                   Browser tab icon
+```
+
+## Brand
+
+Primary cyan `#00B5D6` is the only chromatic accent. Everything else stays grayscale to keep healthcare-sober tone. Cosentus logo always sits top-right.
 
 ## License
 

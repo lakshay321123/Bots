@@ -515,7 +515,7 @@ Return only the JSON array.`;
   const excludedByUntick = selectedRowsRaw.length < rows.length ? (rows.length - selectedRowsRaw.length) : 0;
 
   return (
-    <div style={{ minHeight: '100vh', background: BRAND.surface, padding: '20px', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' }}>
+    <div style={{ background: BRAND.surface, padding: '24px', fontFamily: 'inherit' }}>
       <div style={{ maxWidth: '1400px', margin: '0 auto', background: BRAND.white, borderRadius: '12px', border: `0.5px solid ${BRAND.grayLight}`, overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)', position: 'relative' }}>
 
         <div style={{ background: BRAND.cyan, padding: '14px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
