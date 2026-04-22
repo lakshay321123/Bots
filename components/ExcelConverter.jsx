@@ -341,6 +341,33 @@ export default function ExcelConverter() {
     return () => mq.removeListener(update);
   }, []);
 
+  // Two-file format-matching mode
+  const [mode, setMode] = useState(null);                  // null = unset, 'one-file' or 'two-file'
+  const [targetColumns, setTargetColumns] = useState([]);  // headers from the format file
+  const [targetFileName, setTargetFileName] = useState('');
+  const [columnMapping, setColumnMapping] = useState({});  // { sourceColId: { target, confidence, reason } }
+  const [mappingLoading, setMappingLoading] = useState(false);
+  // In two-file mode, Page 1 defaults to showing only the AI-mapped columns so
+  // the user isn't overwhelmed by 30+ deselected source columns. Flip this on
+  // via the toolbar toggle to reveal everything for manual override.
+  // In one-file mode this is ignored — Page 1 always shows every source column
+  // because that mode exists specifically for manual editing.
+  const [showAllInPick, setShowAllInPick] = useState(false);
+  // Tracks which match request is currently in-flight so stale responses
+  // (from earlier clicks or sheet switches) can be ignored.
+  const matchRequestIdRef = useRef(0);
+  // Indirection so switchSheet/changeHeaderRow (declared early) can call
+  // runColumnMatch (declared later) without a temporal-dead-zone error.
+  const runColumnMatchRef = useRef(null);
+  // Mirror of the latest `columns` state. Read by applyMapping so it can
+  // compute against the freshest columns without taking a stale snapshot
+  // from the caller, and without relying on React running the functional
+  // updater synchronously (which isn't guaranteed in concurrent mode).
+  const columnsRef = useRef([]);
+  useEffect(() => {
+    columnsRef.current = columns;
+  }, [columns]);
+
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
   const [showTemplateDrawer, setShowTemplateDrawer] = useState(false);
@@ -371,14 +398,21 @@ export default function ExcelConverter() {
 
   useEffect(() => { loadTemplates(); }, [loadTemplates]);
 
-  // Keep outputOrder in sync with columns: add any new col ids, drop any that no longer exist
+  // Keep outputOrder in sync with columns: add any new col ids, drop any that no longer exist.
+  // IMPORTANT: never reshuffle the order if the set of ids hasn't changed — the order may
+  // have been carefully arranged (e.g. by AI auto-match to follow target file order).
   useEffect(() => {
     if (columns.length === 0) return;
     const colIds = columns.map(c => c.id);
+    const colIdSet = new Set(colIds);
     setOutputOrder(prev => {
-      const kept = prev.filter(id => colIds.includes(id));
-      const missing = colIds.filter(id => !kept.includes(id));
-      if (missing.length === 0 && kept.length === prev.length) return prev;
+      const prevSet = new Set(prev);
+      // Same set of ids? Don't touch order at all.
+      if (prev.length === colIds.length && prev.every(id => colIdSet.has(id))) {
+        return prev;
+      }
+      const kept = prev.filter(id => colIdSet.has(id));
+      const missing = colIds.filter(id => !prevSet.has(id));
       return [...kept, ...missing];
     });
   }, [columns]);
@@ -424,6 +458,7 @@ export default function ExcelConverter() {
     setRows(newRows);
     setColumnProfiles(profiles);
     setOutputOrder(newColumns.map(c => c.id));
+    return { newColumns, newRows };
   }, []);
 
   // Switch active sheet within the loaded workbook
@@ -443,15 +478,212 @@ export default function ExcelConverter() {
     setCurrentTemplateId(null);
     setMatchedTemplate(null);
     setShowFilters(false);
-    rebuildFromMatrix(matrix, detected);
-  }, [workbook, rebuildFromMatrix]);
+    // Clear any AI mapping — it was bound to the previous sheet's columns
+    setColumnMapping({});
+    const built = rebuildFromMatrix(matrix, detected);
+    // In two-file mode, re-run the AI match against the new sheet's columns
+    if (mode === 'two-file' && targetColumns.length > 0 && built && runColumnMatchRef.current) {
+      runColumnMatchRef.current(built.newColumns, built.newRows, targetColumns);
+    }
+  }, [workbook, rebuildFromMatrix, mode, targetColumns]);
 
   // Manual header-row override (user picks a different row)
   const changeHeaderRow = useCallback((newIdx) => {
     if (!rawSheetData.length) return;
     setHeaderRowIndex(newIdx);
-    rebuildFromMatrix(rawSheetData, newIdx);
-  }, [rawSheetData, rebuildFromMatrix]);
+    // Clear mapping — the new header row yields different originalNames, so the
+    // existing mapping (keyed to old originalNames) is stale
+    setColumnMapping({});
+    const built = rebuildFromMatrix(rawSheetData, newIdx);
+    if (mode === 'two-file' && targetColumns.length > 0 && built && runColumnMatchRef.current) {
+      runColumnMatchRef.current(built.newColumns, built.newRows, targetColumns);
+    }
+  }, [rawSheetData, rebuildFromMatrix, mode, targetColumns]);
+
+  // Apply an AI mapping result: select matched source cols, rename to target names,
+  // order them to match the target file's column order, drop everything else.
+  //
+  // We read the latest columns via columnsRef.current (kept in sync by an
+  // effect above) instead of the caller passing a snapshot. That way the
+  // mapping is applied against whatever the user has in front of them at
+  // the moment the AI response arrives — not what was there 5+ seconds ago
+  // when the request was kicked off. This avoids silently clobbering edits
+  // the user made during the AI wait, and doesn't rely on React running
+  // setColumns's functional updater synchronously (not guaranteed in
+  // concurrent mode).
+  const applyMapping = useCallback((mappings) => {
+    if (!Array.isArray(mappings) || mappings.length === 0) return;
+    const latestColumns = columnsRef.current;
+    if (!Array.isArray(latestColumns) || latestColumns.length === 0) return;
+
+    // Pre-build a source -> mapping lookup (pure data, computed once).
+    const bySource = {};
+    mappings.forEach(m => {
+      if (m.source) {
+        bySource[String(m.source).trim().toLowerCase()] = m;
+      }
+    });
+    const findMapping = (col) => {
+      const byOriginal = bySource[String(col.originalName).trim().toLowerCase()];
+      if (byOriginal) return byOriginal;
+      const byDisplay = bySource[String(col.displayName).trim().toLowerCase()];
+      return byDisplay || null;
+    };
+
+    // Compute the updated column array synchronously — single source of truth
+    // for all three setters below.
+    const updated = latestColumns.map(c => {
+      const m = findMapping(c);
+      if (m) {
+        return { ...c, selected: true, displayName: m.target };
+      }
+      // Unmapped column: untick AND restore its original name so any stale
+      // rename from a previous match doesn't linger.
+      return { ...c, selected: false, displayName: c.originalName };
+    });
+
+    // Build new outputOrder: target order first (mapped, deduped), then unmapped at end.
+    // Match by m.source against originalName or displayName — we only use the
+    // source field Claude returned, never cross-match against the target text
+    // (that could pick an unrelated column whose displayName happens to equal
+    // the target string).
+    const targetToSourceColId = {};
+    mappings.forEach(m => {
+      if (!m.source) return;
+      const normalizedSource = String(m.source).trim().toLowerCase();
+      const col = updated.find(c =>
+        String(c.originalName).trim().toLowerCase() === normalizedSource ||
+        String(c.displayName).trim().toLowerCase() === normalizedSource
+      );
+      if (col) targetToSourceColId[m.target] = col.id;
+    });
+    const seen = new Set();
+    const orderedIds = mappings
+      .map(m => targetToSourceColId[m.target])
+      .filter(id => {
+        if (!id || seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+    const remainingIds = updated
+      .filter(c => !seen.has(c.id))
+      .map(c => c.id);
+
+    // Per-column mapping lookup used to render confidence pills
+    const mapLookup = {};
+    updated.forEach(c => {
+      const m = findMapping(c);
+      if (m) mapLookup[c.id] = m;
+    });
+
+    setColumns(updated);
+    setOutputOrder([...orderedIds, ...remainingIds]);
+    setColumnMapping(mapLookup);
+  }, []);
+
+  // Run the AI mapping: source columns × target columns → mapping
+  const runColumnMatch = useCallback(async (sourceColumns, sourceRows, targets) => {
+    // Bump the request id; this request's response is only applied if it's still current.
+    const requestId = ++matchRequestIdRef.current;
+    setMappingLoading(true);
+    setError('');
+    try {
+      const sampleRows = sourceRows.slice(0, 5).map(r => r.data);
+      const sourceNames = sourceColumns.map(c => c.originalName);
+      const res = await fetch('/api/match-columns', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceColumns: sourceNames, targetColumns: targets, sampleRows }),
+      });
+      // If another match started while this one was in flight, discard.
+      if (requestId !== matchRequestIdRef.current) return;
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(errBody.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (requestId !== matchRequestIdRef.current) return;
+      if (!data.mappings || !Array.isArray(data.mappings)) {
+        throw new Error('No mappings returned');
+      }
+      applyMapping(data.mappings);
+      const matched = data.mappings.filter(m => m.source).length;
+      const lowConf = data.mappings.filter(m => m.source && (m.confidence || 0) < 0.7).length;
+      setSuccessMessage(
+        `Matched ${matched} of ${targets.length} target columns` +
+        (lowConf > 0 ? ` · ${lowConf} need review` : '')
+      );
+      setTimeout(() => setSuccessMessage(''), 5000);
+    } catch (err) {
+      // Only surface error if this is still the active request
+      if (requestId === matchRequestIdRef.current) {
+        setError(`Auto-match failed: ${err.message}. You can still pick columns manually.`);
+      }
+    } finally {
+      if (requestId === matchRequestIdRef.current) {
+        setMappingLoading(false);
+      }
+    }
+  }, [applyMapping]);
+
+  // Keep the ref pointing at the latest runColumnMatch so earlier-declared
+  // callbacks (switchSheet, changeHeaderRow) can invoke it.
+  useEffect(() => {
+    runColumnMatchRef.current = runColumnMatch;
+  }, [runColumnMatch]);
+
+  // Upload the format file (just headers), then if source is already loaded, run the match
+  const handleFormatFileUpload = useCallback(async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setError('');
+
+    // Format files should be tiny — just headers. 10 MB is already generous.
+    const sizeMb = file.size / (1024 * 1024);
+    if (sizeMb > 10) {
+      setError(`Format file is ${sizeMb.toFixed(1)} MB. Format files should contain only column headers — did you upload the wrong file?`);
+      return;
+    }
+
+    setTargetFileName(file.name);
+
+    try {
+      const isCSV = /\.csv$/i.test(file.name);
+      let wb;
+      if (isCSV) {
+        const text = await readFileAsText(file);
+        wb = XLSX.read(text, { type: 'string', cellDates: true, raw: false });
+      } else {
+        const buf = await file.arrayBuffer();
+        wb = XLSX.read(buf, { type: 'array', cellDates: true, cellNF: false, cellText: false });
+      }
+      const firstSheetName = wb.SheetNames[0];
+      const sheet = wb.Sheets[firstSheetName];
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false, blankrows: false });
+      if (!matrix.length) {
+        setError('Format file is empty.');
+        return;
+      }
+      // Detect header row (same logic as input file) — usually row 0 for templates
+      const detected = detectHeaderRow(matrix);
+      const headerRow = matrix[detected] || [];
+      const targets = headerRow
+        .map(h => String(h || '').trim())
+        .filter(h => h !== '');
+      if (targets.length === 0) {
+        setError('Could not find any column headers in the format file.');
+        return;
+      }
+      setTargetColumns(targets);
+
+      // If source already loaded, run the match
+      if (columns.length > 0) {
+        await runColumnMatch(columns, rows, targets);
+      }
+    } catch (err) {
+      setError(`Could not read format file: ${err.message || 'invalid Excel/CSV'}`);
+    }
+  }, [columns, rows, runColumnMatch]);
 
   // Resize handle: clamp between 240 and 1400 px so it always stays usable
   const handleTableResize = useCallback((newHeight) => {
@@ -554,7 +786,7 @@ export default function ExcelConverter() {
       setActiveSheet(firstNonEmpty);
       setRawSheetData(matrix);
       setHeaderRowIndex(detected);
-      rebuildFromMatrix(matrix, detected);
+      const built = rebuildFromMatrix(matrix, detected);
 
       // Match against saved templates using the detected header
       const headerRow = matrix[detected] || [];
@@ -564,11 +796,16 @@ export default function ExcelConverter() {
       const match = currentTemplates.find(t => t.signature === signature);
       if (match) setMatchedTemplate(match);
 
+      // Two-file mode: if a format file is already loaded, run the AI match now
+      if (mode === 'two-file' && targetColumns.length > 0 && built) {
+        await runColumnMatch(built.newColumns, built.newRows, targetColumns);
+      }
+
     } catch (err) {
       setError(`Could not read that file: ${err.message || 'invalid Excel/CSV'}`);
       console.error(err);
     }
-  }, [loadTemplates, rebuildFromMatrix]);
+  }, [loadTemplates, rebuildFromMatrix, mode, targetColumns, runColumnMatch]);
 
   const toggleColumn = (id) => setColumns(cols => cols.map(c => c.id === id ? { ...c, selected: !c.selected } : c));
   const toggleRow = (index) => setRows(rs => rs.map(r => r.index === index ? { ...r, selected: !r.selected } : r));
@@ -626,11 +863,24 @@ export default function ExcelConverter() {
     const selectedIds = columns.filter(c => c.selected).map(c => c.id);
     if (selectedIds.length === 0) { setError('Tick at least one column first.'); return; }
     if (effectivelySelectedRows.length === 0) { setError('No rows match your filters and selections.'); return; }
-    const newOrder = [
-      ...outputOrder.filter(id => selectedIds.includes(id)),
-      ...selectedIds.filter(id => !outputOrder.includes(id)),
-    ];
-    setOutputOrder(newOrder);
+    // Belt-and-suspenders: if the user somehow navigates to Preview while an
+    // AI match is still in flight (the Next button is disabled during
+    // mappingLoading, but keyboard activation or edge cases could still get
+    // past it), invalidate the in-flight request so its late response doesn't
+    // silently rewrite columns after the user clicks Back. The user has
+    // explicitly committed to whatever state they see right now.
+    if (mappingLoading) {
+      matchRequestIdRef.current += 1;
+      setMappingLoading(false);
+    }
+    // Preserve the existing outputOrder (which may have been set by AI auto-match
+    // to follow the target file's column order). Only append IDs that genuinely
+    // don't appear in outputOrder yet (which should never happen since the
+    // sync effect keeps them in step, but defensive).
+    const missing = selectedIds.filter(id => !outputOrder.includes(id));
+    if (missing.length > 0) {
+      setOutputOrder([...outputOrder, ...missing]);
+    }
     setStep('preview');
     setError('');
   };
@@ -822,21 +1072,38 @@ Return only the JSON array.`;
   };
 
   const reset = () => {
+    // Bump the match request id so any in-flight /api/match-columns response
+    // from the file we're discarding fails its token check and is ignored.
+    // Otherwise a slow Claude call from the old file could repopulate columns,
+    // outputOrder, and confidence pills *after* the user clicked "New file".
+    matchRequestIdRef.current += 1;
     setFileName(''); setColumns([]); setRows([]); setError(''); setSuccessMessage('');
     setStep('pick'); setOutputOrder([]); setColumnProfiles({}); setFilterRules([]);
     setCurrentTemplateId(null); setMatchedTemplate(null); setShowFilters(false);
     setWorkbook(null); setSheetNames([]); setActiveSheet('');
     setRawSheetData([]); setHeaderRowIndex(0); setFileSizeWarning('');
+    setMode(null); setTargetColumns([]); setTargetFileName('');
+    setColumnMapping({}); setMappingLoading(false);
+    setShowAllInPick(false);
   };
 
   const selectedColCount = columns.filter(c => c.selected).length;
   const selectedRowsRaw = rows.filter(r => r.selected);
   const hasData = columns.length > 0;
   const displayRows = rows.slice(0, 100);
-  // Page 1: render ALL columns in outputOrder (selected or not; unselected shown dimmed)
-  const pickCols = outputOrder.map(id => columns.find(c => c.id === id)).filter(Boolean);
+  // Page 1 column list.
+  //   one-file mode: show everything (manual editing is the whole point)
+  //   two-file mode: show only the AI-mapped / selected columns by default;
+  //                  user can toggle showAllInPick to reveal the 30+ deselected
+  //                  source columns if they want to manually tick one back in.
+  const allPickCols = outputOrder.map(id => columns.find(c => c.id === id)).filter(Boolean);
+  const pickCols = (mode === 'two-file' && !showAllInPick)
+    ? allPickCols.filter(c => c.selected || columnMapping[c.id])
+    : allPickCols;
+  // How many source columns are currently hidden from Page 1 (for the toggle label)
+  const hiddenPickCount = allPickCols.length - pickCols.length;
   // Page 2: only selected columns in outputOrder — this is the final file
-  const outputCols = pickCols.filter(c => c.selected);
+  const outputCols = allPickCols.filter(c => c.selected);
   const outputBaseName = fileName.replace(/\.(xlsx|xls|csv)$/i, '');
   const currentTemplate = currentTemplateId ? templates.find(t => t.id === currentTemplateId) : null;
   const filteredRowCount = rowsPassingFilters ? rowsPassingFilters.size : rows.length;
@@ -879,116 +1146,255 @@ Return only the JSON array.`;
 
         {!hasData && (
           <div style={{ padding: '40px 24px 48px' }}>
-            <label
-              style={{ display: 'block', maxWidth: '520px', margin: '0 auto', padding: '44px 24px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s' }}
-              onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
-              onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
-            >
-              <Upload size={36} color={BRAND.cyan} strokeWidth={1.5} style={{ marginBottom: '14px' }} />
-              <p style={{ fontSize: '16px', fontWeight: 500, color: BRAND.black, margin: '0 0 6px' }}>Drop your Excel file here</p>
-              <p style={{ fontSize: '13px', color: BRAND.grayDark, margin: 0 }}>or click to browse · .xlsx, .xls, .csv</p>
-              <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} style={{ display: 'none' }} />
-            </label>
 
-            {/* Sample input → output preview */}
-            <div style={{ maxWidth: '1100px', margin: '40px auto 0' }}>
-              <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>What Zeus does</p>
-              <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
-                {/* Input side */}
-                <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.grayLight}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <div>
-                      <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample input</p>
-                      <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export.xlsx</p>
-                    </div>
-                    <span style={{ fontSize: '10px', color: BRAND.grayDark }}>5 cols · messy</span>
+            {/* Mode picker — shown until user chooses */}
+            {mode === null && (
+              <>
+                <div style={{ maxWidth: '780px', margin: '0 auto' }}>
+                  <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>How do you want to start?</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                    <button
+                      onClick={() => setMode('one-file')}
+                      style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                        <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <FileSpreadsheet size={18} color={BRAND.cyan} />
+                        </div>
+                        <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>One file · Manual</p>
+                      </div>
+                      <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
+                        Upload your messy file. Pick the columns you want, rename them, filter rows, save as a template for next time.
+                      </p>
+                      <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you're building a new template →</p>
+                    </button>
+
+                    <button
+                      onClick={() => setMode('two-file')}
+                      style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit', position: 'relative' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
+                    >
+                      <span style={{ position: 'absolute', top: '12px', right: '12px', fontSize: '9px', fontWeight: 600, color: 'white', background: BRAND.cyan, padding: '2px 8px', borderRadius: '10px', letterSpacing: '0.5px' }}>NEW · AI</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                        <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <Sparkles size={18} color={BRAND.cyan} />
+                        </div>
+                        <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>Two files · Auto-match</p>
+                      </div>
+                      <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
+                        Drop your messy file <em>plus</em> a target format file (just headers needed). AI maps the columns automatically.
+                      </p>
+                      <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you have a target format →</p>
+                    </button>
                   </div>
-                  <div style={{ overflowX: 'auto' }}>
-                    <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%', fontFamily: 'ui-monospace, monospace' }}>
-                      <thead>
-                        <tr>
-                          {['PT_FNAME', 'PT_LNAME', 'DOB_RAW', 'MRN_ID', '_temp'].map(h => (
-                            <th key={h} style={{ background: BRAND.surface, padding: '6px 8px', textAlign: 'left', color: BRAND.grayDark, fontWeight: 500, fontSize: '10px', borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap' }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {[
-                          ['john', 'CASTILLO', '5/20/85', 'a12345', '---'],
-                          ['MARIA', 'lopez', '11-3-72', 'A98102', 'x'],
-                          ['David ', ' Chen', '02/14/90', ' a33871', ''],
-                          ['Priya', 'PATEL', '7/22/88', 'A55019', 'NULL'],
-                          ['', 'Williams', '9/15/65', 'a71234', ''],
-                        ].map((row, i) => (
-                          <tr key={i}>
-                            {row.map((cell, j) => (
-                              <td key={j} style={{ padding: '5px 8px', color: BRAND.grayDark, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px' }}>
-                                {cell || <span style={{ color: BRAND.grayMid }}>—</span>}
-                              </td>
+
+                  {templates.length > 0 && (
+                    <p style={{ fontSize: '12px', color: BRAND.grayDark, textAlign: 'center', marginTop: '20px' }}>
+                      Or pick a saved template after uploading.
+                    </p>
+                  )}
+                </div>
+
+                {/* Sample input → output preview (visible on landing so users see what Zeus does) */}
+                <div style={{ maxWidth: '1100px', margin: '40px auto 0' }}>
+                  <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>What Zeus does</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+                    {/* Input side */}
+                    <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.grayLight}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+                      <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div>
+                          <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample input</p>
+                          <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export.xlsx</p>
+                        </div>
+                        <span style={{ fontSize: '10px', color: BRAND.grayDark }}>5 cols · messy</span>
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%', fontFamily: 'ui-monospace, monospace' }}>
+                          <thead>
+                            <tr>
+                              {['PT_FNAME', 'PT_LNAME', 'DOB_RAW', 'MRN_ID', '_temp'].map(h => (
+                                <th key={h} style={{ background: BRAND.surface, padding: '6px 8px', textAlign: 'left', color: BRAND.grayDark, fontWeight: 500, fontSize: '10px', borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap' }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[
+                              ['john', 'CASTILLO', '5/20/85', 'a12345', '---'],
+                              ['MARIA', 'lopez', '11-3-72', 'A98102', 'x'],
+                              ['David ', ' Chen', '02/14/90', ' a33871', ''],
+                              ['Priya', 'PATEL', '7/22/88', 'A55019', 'NULL'],
+                              ['', 'Williams', '9/15/65', 'a71234', ''],
+                            ].map((row, i) => (
+                              <tr key={i}>
+                                {row.map((cell, j) => (
+                                  <td key={j} style={{ padding: '5px 8px', color: BRAND.grayDark, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px' }}>
+                                    {cell || <span style={{ color: BRAND.grayMid }}>—</span>}
+                                  </td>
+                                ))}
+                              </tr>
                             ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-
-                {/* Arrow — rotates 90° when the grid stacks vertically */}
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
-                  <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: BRAND.cyan, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
-                    <ArrowRight size={16} />
-                  </div>
-                </div>
-
-                {/* Output side */}
-                <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.cyan}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 2px 8px rgba(0, 181, 214, 0.12)' }}>
-                  <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <div>
-                      <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample output</p>
-                      <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export_zeus_output.xlsx</p>
+                          </tbody>
+                        </table>
+                      </div>
                     </div>
-                    <span style={{ fontSize: '10px', color: BRAND.cyan, fontWeight: 500 }}>4 cols · clean</span>
-                  </div>
-                  <div style={{ overflowX: 'auto' }}>
-                    <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%' }}>
-                      <thead>
-                        <tr>
-                          {['First Name', 'Last Name', 'Date of Birth', 'MRN'].map(h => (
-                            <th key={h} style={{ background: BRAND.cyan, padding: '6px 8px', textAlign: 'left', color: 'white', fontWeight: 500, fontSize: '10px', whiteSpace: 'nowrap' }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {[
-                          ['John', 'Castillo', '1985-05-20', 'A12345'],
-                          ['Maria', 'Lopez', '1972-11-03', 'A98102'],
-                          ['David', 'Chen', '1990-02-14', 'A33871'],
-                          ['Priya', 'Patel', '1988-07-22', 'A55019'],
-                        ].map((row, i) => (
-                          <tr key={i}>
-                            {row.map((cell, j) => (
-                              <td key={j} style={{ padding: '5px 8px', color: BRAND.black, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px', fontFamily: j === 2 || j === 3 ? 'ui-monospace, monospace' : 'inherit' }}>
-                                {cell}
-                              </td>
+
+                    {/* Arrow — rotates 90° when the grid stacks vertically */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
+                      <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: BRAND.cyan, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
+                        <ArrowRight size={16} />
+                      </div>
+                    </div>
+
+                    {/* Output side */}
+                    <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.cyan}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 2px 8px rgba(0, 181, 214, 0.12)' }}>
+                      <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div>
+                          <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample output</p>
+                          <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export_zeus_output.xlsx</p>
+                        </div>
+                        <span style={{ fontSize: '10px', color: BRAND.cyan, fontWeight: 500 }}>4 cols · clean</span>
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%' }}>
+                          <thead>
+                            <tr>
+                              {['First Name', 'Last Name', 'Date of Birth', 'MRN'].map(h => (
+                                <th key={h} style={{ background: BRAND.cyan, padding: '6px 8px', textAlign: 'left', color: 'white', fontWeight: 500, fontSize: '10px', whiteSpace: 'nowrap' }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[
+                              ['John', 'Castillo', '1985-05-20', 'A12345'],
+                              ['Maria', 'Lopez', '1972-11-03', 'A98102'],
+                              ['David', 'Chen', '1990-02-14', 'A33871'],
+                              ['Priya', 'Patel', '1988-07-22', 'A55019'],
+                            ].map((row, i) => (
+                              <tr key={i}>
+                                {row.map((cell, j) => (
+                                  <td key={j} style={{ padding: '5px 8px', color: BRAND.black, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px', fontFamily: j === 2 || j === 3 ? 'ui-monospace, monospace' : 'inherit' }}>
+                                    {cell}
+                                  </td>
+                                ))}
+                              </tr>
                             ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'center', gap: '24px', flexWrap: 'wrap', fontSize: '11px', color: BRAND.grayDark }}>
+                    <span>✓ Renamed: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>PT_FNAME → First Name</code></span>
+                    <span>✓ Dates: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>5/20/85 → 1985-05-20</code></span>
+                    <span>✓ Trimmed whitespace</span>
+                    <span>✓ Dropped junk column <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>_temp</code></span>
+                    <span>✓ Filtered row missing first name</span>
                   </div>
                 </div>
-              </div>
+              </>
+            )}
 
-              <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'center', gap: '24px', flexWrap: 'wrap', fontSize: '11px', color: BRAND.grayDark }}>
-                <span>✓ Renamed: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>PT_FNAME → First Name</code></span>
-                <span>✓ Dates: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>5/20/85 → 1985-05-20</code></span>
-                <span>✓ Trimmed whitespace</span>
-                <span>✓ Dropped junk column <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>_temp</code></span>
-                <span>✓ Filtered row missing first name</span>
-              </div>
-            </div>
+            {/* One-file mode dropzone */}
+            {mode === 'one-file' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
+                  <button onClick={() => setMode(null)} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', padding: '4px 8px' }}>
+                    <ArrowLeft size={12} /> Back to mode picker
+                  </button>
+                </div>
+                <label
+                  style={{ display: 'block', maxWidth: '520px', margin: '0 auto', padding: '44px 24px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
+                  onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
+                >
+                  <Upload size={36} color={BRAND.cyan} strokeWidth={1.5} style={{ marginBottom: '14px' }} />
+                  <p style={{ fontSize: '16px', fontWeight: 500, color: BRAND.black, margin: '0 0 6px' }}>Drop your Excel file here</p>
+                  <p style={{ fontSize: '13px', color: BRAND.grayDark, margin: 0 }}>or click to browse · .xlsx, .xls, .csv</p>
+                  <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} style={{ display: 'none' }} />
+                </label>
+              </>
+            )}
 
-            {templates.length > 0 && (
+            {/* Two-file mode: format dropzone first, then input dropzone */}
+            {mode === 'two-file' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
+                  <button onClick={() => { setMode(null); setTargetColumns([]); setTargetFileName(''); }} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', padding: '4px 8px' }}>
+                    <ArrowLeft size={12} /> Back to mode picker
+                  </button>
+                </div>
+
+                <div style={{ maxWidth: '900px', margin: '0 auto', display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+
+                  {/* Step 1: Format/target file */}
+                  <div>
+                    <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', letterSpacing: '0.5px', textTransform: 'uppercase', fontWeight: 500 }}>Step 1 · Target format</p>
+                    {targetColumns.length === 0 ? (
+                      <label
+                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px 20px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s', minHeight: '200px' }}
+                        onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
+                        onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
+                      >
+                        <Upload size={28} color={BRAND.cyan} strokeWidth={1.5} style={{ marginBottom: '10px' }} />
+                        <p style={{ fontSize: '14px', fontWeight: 500, color: BRAND.black, margin: '0 0 4px' }}>The format you need</p>
+                        <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: 0 }}>An Excel/CSV with the headers you want</p>
+                        <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '4px 0 0' }}>Data rows are ignored</p>
+                        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFormatFileUpload} style={{ display: 'none' }} />
+                      </label>
+                    ) : (
+                      <div style={{ padding: '20px', border: `1.5px solid ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '40', minHeight: '200px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                          <Check size={14} color={BRAND.cyan} />
+                          <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{targetFileName}</p>
+                          <button onClick={() => { setTargetColumns([]); setTargetFileName(''); }} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, cursor: 'pointer', padding: '2px' }} title="Remove">
+                            <X size={12} />
+                          </button>
+                        </div>
+                        <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', textTransform: 'uppercase', letterSpacing: '0.4px' }}>{targetColumns.length} target columns</p>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '110px', overflowY: 'auto' }}>
+                          {targetColumns.map((col, i) => (
+                            <span key={i} style={{ fontSize: '10px', background: BRAND.white, color: BRAND.cyan, padding: '3px 8px', borderRadius: '10px', border: `0.5px solid ${BRAND.cyanSoft}`, whiteSpace: 'nowrap' }}>{col}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Arrow between — rotates when stacked on narrow viewports */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
+                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: targetColumns.length > 0 ? BRAND.cyan : BRAND.grayLight, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.2s', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
+                      <ArrowRight size={16} />
+                    </div>
+                  </div>
+
+                  {/* Step 2: Input file */}
+                  <div>
+                    <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', letterSpacing: '0.5px', textTransform: 'uppercase', fontWeight: 500 }}>Step 2 · Your messy file</p>
+                    <label
+                      style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px 20px', border: `2px dashed ${targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid}`, borderRadius: '12px', background: targetColumns.length > 0 ? BRAND.cyanLight + '50' : BRAND.surface, textAlign: 'center', cursor: targetColumns.length > 0 ? 'pointer' : 'not-allowed', opacity: targetColumns.length > 0 ? 1 : 0.5, minHeight: '200px' }}
+                    >
+                      <Upload size={28} color={targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid} strokeWidth={1.5} style={{ marginBottom: '10px' }} />
+                      <p style={{ fontSize: '14px', fontWeight: 500, color: BRAND.black, margin: '0 0 4px' }}>Your data file</p>
+                      <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: 0 }}>The messy export to be cleaned</p>
+                      <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '4px 0 0' }}>{targetColumns.length > 0 ? 'AI will auto-match columns' : 'Upload format file first ↑'}</p>
+                      <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} disabled={targetColumns.length === 0} style={{ display: 'none' }} />
+                    </label>
+                  </div>
+                </div>
+
+                {mappingLoading && (
+                  <p style={{ textAlign: 'center', color: BRAND.cyan, fontSize: '12px', marginTop: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                    <Sparkles size={14} /> Claude is matching your columns…
+                  </p>
+                )}
+              </>
+            )}
+
+            {templates.length > 0 && mode !== null && (
               <div style={{ maxWidth: '520px', margin: '32px auto 0' }}>
                 <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 10px', letterSpacing: '0.5px', textTransform: 'uppercase' }}>Your saved templates</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
@@ -1027,6 +1433,14 @@ Return only the JSON array.`;
             {fileSizeWarning && (
               <div style={{ padding: '8px 20px', background: '#FFF5E5', borderBottom: `0.5px solid ${BRAND.grayLight}`, color: BRAND.warning, fontSize: '12px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <AlertTriangle size={13} />{fileSizeWarning}
+              </div>
+            )}
+
+            {mappingLoading && (
+              <div style={{ padding: '10px 20px', background: BRAND.cyanLight, borderBottom: `0.5px solid ${BRAND.cyan}`, color: BRAND.cyan, fontSize: '12px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Sparkles size={14} />
+                <span>Claude is matching your columns against the target format…</span>
+                <span style={{ color: BRAND.grayDark, fontWeight: 400, marginLeft: 'auto' }}>Usually 3–10 seconds · Next is disabled until matching finishes</span>
               </div>
             )}
 
@@ -1071,6 +1485,34 @@ Return only the JSON array.`;
                     <span style={{ color: BRAND.grayDark, fontSize: '11px' }}>auto-detected · adjust if title bars are above the headers</span>
                   </div>
                 )}
+              </div>
+            )}
+
+            {mode === 'two-file' && targetColumns.length > 0 && (
+              <div style={{ padding: '10px 20px', background: BRAND.cyanLight, borderBottom: `0.5px solid ${BRAND.cyanSoft}`, display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                <Sparkles size={14} color={BRAND.cyan} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ fontSize: '12px', fontWeight: 500, color: BRAND.black, margin: 0 }}>
+                    {mappingLoading
+                      ? 'Claude is matching columns…'
+                      : `Auto-matched against ${targetFileName} · ${Object.keys(columnMapping).length} of ${targetColumns.length} columns mapped`}
+                  </p>
+                  <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '2px 0 0' }}>
+                    <span style={{ color: '#16A34A' }}>● high</span>
+                    {' · '}
+                    <span style={{ color: '#C57300' }}>● medium</span>
+                    {' · '}
+                    <span style={{ color: BRAND.danger }}>● low confidence</span>
+                    {' · review the dots above each column letter'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => runColumnMatch(columns, rows, targetColumns)}
+                  disabled={mappingLoading}
+                  style={{ background: 'white', color: BRAND.cyan, border: `1px solid ${BRAND.cyan}`, padding: '5px 12px', borderRadius: '4px', fontSize: '11px', fontWeight: 500, cursor: mappingLoading ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px', opacity: mappingLoading ? 0.5 : 1 }}
+                >
+                  <Sparkles size={11} /> Re-match
+                </button>
               </div>
             )}
 
@@ -1122,17 +1564,19 @@ Return only the JSON array.`;
                 </button>
                 <button
                   onClick={goToPreview}
-                  disabled={selectedColCount === 0 || effectivelySelectedRows.length === 0}
+                  disabled={selectedColCount === 0 || effectivelySelectedRows.length === 0 || mappingLoading}
                   title={
-                    selectedColCount === 0
-                      ? 'Tick at least one column to continue'
-                      : effectivelySelectedRows.length === 0
-                        ? 'No rows match — adjust or clear your filter rules'
-                        : ''
+                    mappingLoading
+                      ? 'Wait for Claude to finish matching columns…'
+                      : selectedColCount === 0
+                        ? 'Tick at least one column to continue'
+                        : effectivelySelectedRows.length === 0
+                          ? 'No rows match — adjust or clear your filter rules'
+                          : ''
                   }
-                  style={{ background: BRAND.cyan, color: 'white', border: 'none', padding: '7px 14px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 0.5 : 1 }}
+                  style={{ background: BRAND.cyan, color: 'white', border: 'none', padding: '7px 14px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (selectedColCount === 0 || effectivelySelectedRows.length === 0 || mappingLoading) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (selectedColCount === 0 || effectivelySelectedRows.length === 0 || mappingLoading) ? 0.5 : 1 }}
                 >
-                  Next · preview<ArrowRight size={13} />
+                  {mappingLoading ? 'Matching…' : <>Next · preview<ArrowRight size={13} /></>}
                 </button>
               </div>
             </div>
@@ -1171,6 +1615,19 @@ Return only the JSON array.`;
               <button onClick={() => setShowFilters(s => !s)} style={{ background: showFilters ? BRAND.cyanLight : 'transparent', border: 'none', color: BRAND.cyan, fontSize: '11px', fontWeight: 500, cursor: 'pointer', padding: showFilters ? '3px 8px' : 0, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <FilterIcon size={12} />Filter rows {filterRules.length > 0 && `· ${filterRules.length}`}
               </button>
+              {mode === 'two-file' && (hiddenPickCount > 0 || showAllInPick) && (
+                <button
+                  onClick={() => setShowAllInPick(v => !v)}
+                  style={{ background: showAllInPick ? BRAND.cyanLight : 'transparent', border: 'none', color: BRAND.cyan, fontSize: '11px', fontWeight: 500, cursor: 'pointer', padding: showAllInPick ? '3px 8px' : 0, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                  title={showAllInPick
+                    ? 'Hide the unmapped source columns and focus on the mapping only'
+                    : `Show the ${hiddenPickCount} source column${hiddenPickCount === 1 ? '' : 's'} that Claude didn't map so you can tick one in manually`}
+                >
+                  {showAllInPick
+                    ? <>Hide unmapped · focus on mapping</>
+                    : <>Show {hiddenPickCount} unmapped source column{hiddenPickCount === 1 ? '' : 's'}</>}
+                </button>
+              )}
               <span style={{ marginLeft: 'auto', fontSize: '11px', color: BRAND.grayDark }}>Tip: click name to rename · use arrows to reorder columns</span>
             </div>
 
@@ -1225,11 +1682,22 @@ Return only the JSON array.`;
                     {pickCols.map((col, i) => {
                       const isFirst = i === 0;
                       const isLast = i === pickCols.length - 1;
+                      const mapEntry = columnMapping[col.id];
+                      const confColor = !mapEntry ? null
+                        : mapEntry.confidence >= 0.85 ? '#16A34A'   // green
+                        : mapEntry.confidence >= 0.6 ? '#C57300'   // amber
+                        : BRAND.danger;                            // red
                       return (
                         <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2, height: '36px', boxSizing: 'border-box' }}>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
                             <input type="checkbox" checked={col.selected} onChange={() => toggleColumn(col.id)} style={{ accentColor: BRAND.cyan, width: '14px', height: '14px', margin: 0, cursor: 'pointer', flexShrink: 0 }} />
                             <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                              {confColor && (
+                                <span
+                                  title={`Mapped to "${mapEntry.target}" · ${Math.round((mapEntry.confidence || 0) * 100)}% confidence · ${mapEntry.reason || ''}`}
+                                  style={{ width: '8px', height: '8px', borderRadius: '50%', background: confColor, flexShrink: 0, marginRight: '2px' }}
+                                />
+                              )}
                               <button onClick={() => moveColumn(col.id, 'left')} disabled={isFirst} style={{ background: 'transparent', border: 'none', color: isFirst ? BRAND.grayMid : BRAND.cyan, padding: '2px', borderRadius: '3px', cursor: isFirst ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center' }} title="Move left">
                                 <ChevronLeft size={12} />
                               </button>
