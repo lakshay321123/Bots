@@ -143,35 +143,41 @@ Each "source" value must EXACTLY match one of the SOURCE column names above (or 
       return Response.json({ error: 'Claude returned malformed mapping items' }, { status: 502 });
     }
 
-    // Stricter contract validation: targets must exactly match the submitted
-    // set (no hallucinated targets, no missing ones), sources (if non-null)
-    // must exist in the submitted sourceColumns, and no source can be claimed
-    // by two different targets — otherwise the client would render duplicate
-    // columns or silently drop expected ones.
-    const submittedTargets = new Set(targetColumns.map(t => String(t)));
+    // Stricter contract validation. The client uses the response array's
+    // order to build outputOrder — so we need exact sequence equality, not
+    // just set membership. Specifically:
+    //   - mappings.length must equal targetColumns.length (no missing/extra)
+    //   - mappings[i].target must equal targetColumns[i] (no reorder/dupe/hallucinate)
+    //   - sources (if non-null) must exist in submitted sourceColumns
+    //   - no source can be claimed by two targets
     const submittedSources = new Set(sourceColumns.map(s => String(s)));
     const seenSource = new Set();
     let contractError = null;
-    for (const m of parsed.mappings) {
-      if (!submittedTargets.has(m.target)) {
-        contractError = 'unknown_target';
-        break;
-      }
-      if (m.source !== null && m.source !== undefined && m.source !== '') {
-        if (!submittedSources.has(m.source)) {
-          contractError = 'unknown_source';
+    if (parsed.mappings.length !== targetColumns.length) {
+      contractError = 'target_count_mismatch';
+    } else {
+      for (let i = 0; i < parsed.mappings.length; i++) {
+        const m = parsed.mappings[i];
+        if (m.target !== String(targetColumns[i])) {
+          contractError = 'target_sequence_mismatch';
           break;
         }
-        if (seenSource.has(m.source)) {
-          contractError = 'duplicate_source';
-          break;
+        if (m.source !== null && m.source !== undefined && m.source !== '') {
+          if (!submittedSources.has(m.source)) {
+            contractError = 'unknown_source';
+            break;
+          }
+          if (seenSource.has(m.source)) {
+            contractError = 'duplicate_source';
+            break;
+          }
+          seenSource.add(m.source);
         }
-        seenSource.add(m.source);
       }
     }
     if (contractError) {
-      console.error('[match-columns] mapping contract violation: %s (target_count=%d, source_count=%d)',
-        contractError, targetColumns.length, sourceColumns.length);
+      console.error('[match-columns] mapping contract violation: %s (mapping_count=%d, target_count=%d, source_count=%d)',
+        contractError, parsed.mappings.length, targetColumns.length, sourceColumns.length);
       return Response.json({ error: 'Claude returned an invalid mapping; please retry' }, { status: 502 });
     }
 

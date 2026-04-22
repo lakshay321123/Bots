@@ -233,6 +233,14 @@ export default function ExcelConverter() {
   // Indirection so switchSheet/changeHeaderRow (declared early) can call
   // runColumnMatch (declared later) without a temporal-dead-zone error.
   const runColumnMatchRef = useRef(null);
+  // Mirror of the latest `columns` state. Read by applyMapping so it can
+  // compute against the freshest columns without taking a stale snapshot
+  // from the caller, and without relying on React running the functional
+  // updater synchronously (which isn't guaranteed in concurrent mode).
+  const columnsRef = useRef([]);
+  useEffect(() => {
+    columnsRef.current = columns;
+  }, [columns]);
 
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
@@ -369,15 +377,20 @@ export default function ExcelConverter() {
   // Apply an AI mapping result: select matched source cols, rename to target names,
   // order them to match the target file's column order, drop everything else.
   //
-  // We use the functional setColumns(prev => ...) updater so the mapping is
-  // applied against whatever the user has in front of them right now — not
-  // a snapshot taken when the API call started 5+ seconds ago. This matters
-  // because the user may have toggled column selection or renamed something
-  // while the AI request was in flight.
+  // We read the latest columns via columnsRef.current (kept in sync by an
+  // effect above) instead of the caller passing a snapshot. That way the
+  // mapping is applied against whatever the user has in front of them at
+  // the moment the AI response arrives — not what was there 5+ seconds ago
+  // when the request was kicked off. This avoids silently clobbering edits
+  // the user made during the AI wait, and doesn't rely on React running
+  // setColumns's functional updater synchronously (not guaranteed in
+  // concurrent mode).
   const applyMapping = useCallback((mappings) => {
     if (!Array.isArray(mappings) || mappings.length === 0) return;
+    const latestColumns = columnsRef.current;
+    if (!Array.isArray(latestColumns) || latestColumns.length === 0) return;
 
-    // Pre-build the lookup map once outside the state updater (pure data).
+    // Pre-build a source -> mapping lookup (pure data, computed once).
     const bySource = {};
     mappings.forEach(m => {
       if (m.source) {
@@ -391,41 +404,30 @@ export default function ExcelConverter() {
       return byDisplay || null;
     };
 
-    // We need to share the `updated` array between three setters
-    // (columns, outputOrder, columnMapping). Compute it once inside the
-    // setColumns updater, capture it in this closure, then use it for the
-    // other two setters which run synchronously right after.
-    let updatedSnapshot = null;
-
-    setColumns(prev => {
-      const updated = prev.map(c => {
-        const m = findMapping(c);
-        if (m) {
-          return { ...c, selected: true, displayName: m.target };
-        }
-        // If a column isn't in this mapping, untick AND restore its original
-        // name so any stale rename from a previous match doesn't linger.
-        return { ...c, selected: false, displayName: c.originalName };
-      });
-      updatedSnapshot = updated;
-      return updated;
+    // Compute the updated column array synchronously — single source of truth
+    // for all three setters below.
+    const updated = latestColumns.map(c => {
+      const m = findMapping(c);
+      if (m) {
+        return { ...c, selected: true, displayName: m.target };
+      }
+      // Unmapped column: untick AND restore its original name so any stale
+      // rename from a previous match doesn't linger.
+      return { ...c, selected: false, displayName: c.originalName };
     });
 
-    // Defensive guard: if for some reason setColumns didn't run synchronously
-    // (it should, but React internals could change), bail out before using
-    // a null snapshot.
-    if (!updatedSnapshot) return;
-
-    // Build new outputOrder: target order first (only mapped, deduped), then unmapped at end.
+    // Build new outputOrder: target order first (mapped, deduped), then unmapped at end.
+    // Match by m.source against originalName or displayName — we only use the
+    // source field Claude returned, never cross-match against the target text
+    // (that could pick an unrelated column whose displayName happens to equal
+    // the target string).
     const targetToSourceColId = {};
     mappings.forEach(m => {
       if (!m.source) return;
       const normalizedSource = String(m.source).trim().toLowerCase();
-      const normalizedTarget = String(m.target).trim().toLowerCase();
-      const col = updatedSnapshot.find(c =>
+      const col = updated.find(c =>
         String(c.originalName).trim().toLowerCase() === normalizedSource ||
-        String(c.displayName).trim().toLowerCase() === normalizedSource ||
-        String(c.displayName).trim().toLowerCase() === normalizedTarget
+        String(c.displayName).trim().toLowerCase() === normalizedSource
       );
       if (col) targetToSourceColId[m.target] = col.id;
     });
@@ -437,17 +439,18 @@ export default function ExcelConverter() {
         seen.add(id);
         return true;
       });
-    const remainingIds = updatedSnapshot
+    const remainingIds = updated
       .filter(c => !seen.has(c.id))
       .map(c => c.id);
 
-    // Build a per-column mapping lookup for confidence pills
+    // Per-column mapping lookup used to render confidence pills
     const mapLookup = {};
-    updatedSnapshot.forEach(c => {
+    updated.forEach(c => {
       const m = findMapping(c);
       if (m) mapLookup[c.id] = m;
     });
 
+    setColumns(updated);
     setOutputOrder([...orderedIds, ...remainingIds]);
     setColumnMapping(mapLookup);
   }, []);
@@ -926,6 +929,11 @@ Return only the JSON array.`;
   };
 
   const reset = () => {
+    // Bump the match request id so any in-flight /api/match-columns response
+    // from the file we're discarding fails its token check and is ignored.
+    // Otherwise a slow Claude call from the old file could repopulate columns,
+    // outputOrder, and confidence pills *after* the user clicked "New file".
+    matchRequestIdRef.current += 1;
     setFileName(''); setColumns([]); setRows([]); setError(''); setSuccessMessage('');
     setStep('pick'); setOutputOrder([]); setColumnProfiles({}); setFilterRules([]);
     setCurrentTemplateId(null); setMatchedTemplate(null); setShowFilters(false);
