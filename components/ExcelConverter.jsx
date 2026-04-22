@@ -137,6 +137,69 @@ function TypeIcon({ type, size = 10 }) {
   return <Type size={size} />;
 }
 
+// Format a JS Date as YYYY-MM-DD (ISO date, the safest interchange format)
+function formatDateValue(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    const y = v.getFullYear();
+    const m = String(v.getMonth() + 1).padStart(2, '0');
+    const d = String(v.getDate()).padStart(2, '0');
+    // If time component is meaningful (non-midnight), include it
+    const hh = v.getHours(), mm = v.getMinutes(), ss = v.getSeconds();
+    if (hh === 0 && mm === 0 && ss === 0) return `${y}-${m}-${d}`;
+    return `${y}-${m}-${d} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  }
+  return v;
+}
+
+// Walk the matrix and ISO-format any Date cells, leaving everything else alone
+function normalizeDates(matrix) {
+  return matrix.map(row =>
+    Array.isArray(row) ? row.map(cell => (cell instanceof Date ? formatDateValue(cell) : cell)) : row
+  );
+}
+
+// Score a candidate row's "header-likeness" — string-heavy, mostly unique, no numbers
+function scoreHeaderRow(row) {
+  if (!Array.isArray(row) || row.length === 0) return 0;
+  const cells = row.map(c => (c == null ? '' : String(c).trim()));
+  const nonEmpty = cells.filter(c => c !== '');
+  if (nonEmpty.length === 0) return 0;
+  const fillRatio = nonEmpty.length / cells.length;
+  const stringy = nonEmpty.filter(c => isNaN(Number(c))).length / nonEmpty.length;
+  const unique = new Set(nonEmpty.map(c => c.toLowerCase())).size / nonEmpty.length;
+  // Penalize very short rows (likely title bars) unless they're wide enough
+  const widthBonus = Math.min(cells.length / 6, 1);
+  return fillRatio * 0.3 + stringy * 0.4 + unique * 0.2 + widthBonus * 0.1;
+}
+
+// Auto-detect the most likely header row in the first ~10 rows
+function detectHeaderRow(matrix) {
+  const candidates = matrix.slice(0, 10);
+  let bestIdx = 0, bestScore = -1;
+  candidates.forEach((row, i) => {
+    const s = scoreHeaderRow(row);
+    // Header should also be followed by data rows that are NOT also pure-text-unique
+    // i.e. data rows tend to have more numbers / repetition
+    if (s > bestScore) { bestScore = s; bestIdx = i; }
+  });
+  return bestIdx;
+}
+
+// Detect UTF-16 BOM and decode appropriately
+async function readFileAsText(file) {
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+  // UTF-16 LE BOM: FF FE  | UTF-16 BE BOM: FE FF
+  if (bytes[0] === 0xFF && bytes[1] === 0xFE) {
+    return new TextDecoder('utf-16le').decode(buf);
+  }
+  if (bytes[0] === 0xFE && bytes[1] === 0xFF) {
+    return new TextDecoder('utf-16be').decode(buf);
+  }
+  // Default UTF-8 (handles BOM-prefixed UTF-8 too)
+  return new TextDecoder('utf-8').decode(buf);
+}
+
 export default function ExcelConverter() {
   const [fileName, setFileName] = useState('');
   const [columns, setColumns] = useState([]);
@@ -149,6 +212,14 @@ export default function ExcelConverter() {
   const [columnProfiles, setColumnProfiles] = useState({});
   const [filterRules, setFilterRules] = useState([]);
   const [showFilters, setShowFilters] = useState(false);
+
+  // Multi-sheet + header-row support
+  const [workbook, setWorkbook] = useState(null);          // raw XLSX workbook
+  const [sheetNames, setSheetNames] = useState([]);
+  const [activeSheet, setActiveSheet] = useState('');
+  const [rawSheetData, setRawSheetData] = useState([]);    // raw rows incl. pre-header noise
+  const [headerRowIndex, setHeaderRowIndex] = useState(0); // which row is the header (0-based)
+  const [fileSizeWarning, setFileSizeWarning] = useState('');
 
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
@@ -192,12 +263,83 @@ export default function ExcelConverter() {
     });
   }, [columns]);
 
+  // Build columns + rows from a raw matrix given a chosen header-row index
+  const rebuildFromMatrix = useCallback((matrix, headerIdx) => {
+    if (!matrix || matrix.length === 0) {
+      setError('Sheet has no data.');
+      return;
+    }
+    const headerRow = matrix[headerIdx] || [];
+    const dataRows = matrix.slice(headerIdx + 1);
+
+    // Determine the widest row so we don't lose columns to ragged data
+    const widestRow = matrix.reduce((max, r) => Math.max(max, Array.isArray(r) ? r.length : 0), 0);
+    const colCount = Math.max(headerRow.length, widestRow);
+
+    const newColumns = Array.from({ length: colCount }, (_, i) => {
+      const raw = headerRow[i];
+      const cleanName = String(raw || `Column ${getColumnLetter(i)}`).trim() || `Column ${getColumnLetter(i)}`;
+      return {
+        id: `col_${i}`,
+        letter: getColumnLetter(i),
+        originalName: cleanName,
+        displayName: cleanName,
+        selected: true,
+        originalIndex: i,
+      };
+    });
+
+    const newRows = dataRows.map((row, i) => ({
+      index: i,
+      data: Array.isArray(row) ? row : [],
+      selected: true,
+    }));
+
+    const profiles = {};
+    newColumns.forEach(col => {
+      profiles[col.id] = profileColumn(newRows, col.originalIndex);
+    });
+
+    setColumns(newColumns);
+    setRows(newRows);
+    setColumnProfiles(profiles);
+    setOutputOrder(newColumns.map(c => c.id));
+  }, []);
+
+  // Switch active sheet within the loaded workbook
+  const switchSheet = useCallback((sheetName) => {
+    if (!workbook || !workbook.Sheets[sheetName]) return;
+    const sheet = workbook.Sheets[sheetName];
+    // sheet_to_json with header:1 returns array-of-arrays (matrix)
+    let matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false, blankrows: false });
+    matrix = normalizeDates(matrix);
+    const detected = detectHeaderRow(matrix);
+    setActiveSheet(sheetName);
+    setRawSheetData(matrix);
+    setHeaderRowIndex(detected);
+    setStep('pick');
+    setOutputOrder([]);
+    setFilterRules([]);
+    setCurrentTemplateId(null);
+    setMatchedTemplate(null);
+    setShowFilters(false);
+    rebuildFromMatrix(matrix, detected);
+  }, [workbook, rebuildFromMatrix]);
+
+  // Manual header-row override (user picks a different row)
+  const changeHeaderRow = useCallback((newIdx) => {
+    if (!rawSheetData.length) return;
+    setHeaderRowIndex(newIdx);
+    rebuildFromMatrix(rawSheetData, newIdx);
+  }, [rawSheetData, rebuildFromMatrix]);
+
   const handleFileUpload = useCallback(async (e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
 
     setError('');
     setSuccessMessage('');
+    setFileSizeWarning('');
     setFileName(file.name);
     setStep('pick');
     setOutputOrder([]);
@@ -205,59 +347,101 @@ export default function ExcelConverter() {
     setCurrentTemplateId(null);
     setMatchedTemplate(null);
     setShowFilters(false);
+    setWorkbook(null);
+    setSheetNames([]);
+    setActiveSheet('');
+    setRawSheetData([]);
+    setHeaderRowIndex(0);
+
+    // File-size sanity check (browser SheetJS struggles past ~50MB)
+    const sizeMb = file.size / (1024 * 1024);
+    if (sizeMb > 100) {
+      setError(`File is ${sizeMb.toFixed(1)} MB. Browser parsing fails above ~100 MB. Split the file or wait for the server-backed worker.`);
+      return;
+    }
+    if (sizeMb > 25) {
+      setFileSizeWarning(`Large file (${sizeMb.toFixed(1)} MB). Parsing may take 10–30 seconds.`);
+    }
 
     try {
-      const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data, { type: 'array', cellDates: true });
-      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rawData = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: '', raw: false });
+      const isCSV = /\.csv$/i.test(file.name);
+      let wb;
 
-      if (!rawData || rawData.length < 2) {
-        setError('File needs at least a header row and one data row.');
+      if (isCSV) {
+        // CSV path — handle UTF-16 BOM detection and decode
+        const text = await readFileAsText(file);
+        wb = XLSX.read(text, { type: 'string', cellDates: true, raw: false });
+      } else {
+        // Excel path — binary, with date parsing and merged-cell handling
+        const buf = await file.arrayBuffer();
+        wb = XLSX.read(buf, { type: 'array', cellDates: true, cellNF: false, cellText: false });
+      }
+
+      if (!wb.SheetNames || wb.SheetNames.length === 0) {
+        setError("Couldn't find any sheets in this file.");
         return;
       }
 
-      const headers = rawData[0];
-      const dataRows = rawData.slice(1);
-
-      const newColumns = headers.map((name, i) => {
-        const cleanName = String(name || `Column ${getColumnLetter(i)}`).trim();
-        return {
-          id: `col_${i}`,
-          letter: getColumnLetter(i),
-          originalName: cleanName,
-          displayName: cleanName,
-          selected: true,
-          originalIndex: i,
-        };
+      // Apply merged-cell unmerging — copy the top-left value into all merged cells
+      // so users see the value in every cell rather than blanks
+      wb.SheetNames.forEach(name => {
+        const sheet = wb.Sheets[name];
+        if (sheet && sheet['!merges']) {
+          sheet['!merges'].forEach(merge => {
+            const topLeftAddr = XLSX.utils.encode_cell({ r: merge.s.r, c: merge.s.c });
+            const topLeftCell = sheet[topLeftAddr];
+            if (!topLeftCell) return;
+            for (let r = merge.s.r; r <= merge.e.r; r++) {
+              for (let c = merge.s.c; c <= merge.e.c; c++) {
+                if (r === merge.s.r && c === merge.s.c) continue;
+                const addr = XLSX.utils.encode_cell({ r, c });
+                if (!sheet[addr]) sheet[addr] = { ...topLeftCell };
+              }
+            }
+          });
+        }
       });
 
-      const newRows = dataRows.map((row, i) => ({
-        index: i,
-        data: row,
-        selected: true,
-      }));
+      setWorkbook(wb);
+      setSheetNames(wb.SheetNames);
 
-      const profiles = {};
-      newColumns.forEach(col => {
-        profiles[col.id] = profileColumn(newRows, col.originalIndex);
-      });
+      // Pick first non-empty sheet as the default
+      const firstNonEmpty = wb.SheetNames.find(name => {
+        const s = wb.Sheets[name];
+        if (!s) return false;
+        const test = XLSX.utils.sheet_to_json(s, { header: 1, defval: '', raw: false, blankrows: false });
+        return test.length > 0;
+      }) || wb.SheetNames[0];
 
-      setColumns(newColumns);
-      setRows(newRows);
-      setColumnProfiles(profiles);
-      setOutputOrder(newColumns.map(c => c.id));
+      const sheet = wb.Sheets[firstNonEmpty];
+      let matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false, blankrows: false });
+      matrix = normalizeDates(matrix);
 
-      const signature = hashColumnSignature(newColumns.map(c => c.originalName));
+      if (matrix.length < 2) {
+        setError(`Sheet "${firstNonEmpty}" needs at least a header row and one data row.`);
+        setActiveSheet(firstNonEmpty);
+        return;
+      }
+
+      const detected = detectHeaderRow(matrix);
+      setActiveSheet(firstNonEmpty);
+      setRawSheetData(matrix);
+      setHeaderRowIndex(detected);
+      rebuildFromMatrix(matrix, detected);
+
+      // Match against saved templates using the detected header
+      const headerRow = matrix[detected] || [];
+      const colNames = headerRow.map(h => String(h || '').trim());
+      const signature = hashColumnSignature(colNames);
       const currentTemplates = await loadTemplates();
       const match = currentTemplates.find(t => t.signature === signature);
       if (match) setMatchedTemplate(match);
 
     } catch (err) {
-      setError("Could not read that file. Make sure it's a valid Excel or CSV.");
+      setError(`Could not read that file: ${err.message || 'invalid Excel/CSV'}`);
       console.error(err);
     }
-  }, [loadTemplates]);
+  }, [loadTemplates, rebuildFromMatrix]);
 
   const toggleColumn = (id) => setColumns(cols => cols.map(c => c.id === id ? { ...c, selected: !c.selected } : c));
   const toggleRow = (index) => setRows(rs => rs.map(r => r.index === index ? { ...r, selected: !r.selected } : r));
@@ -514,6 +698,8 @@ Return only the JSON array.`;
     setFileName(''); setColumns([]); setRows([]); setError(''); setSuccessMessage('');
     setStep('pick'); setOutputOrder([]); setColumnProfiles({}); setFilterRules([]);
     setCurrentTemplateId(null); setMatchedTemplate(null); setShowFilters(false);
+    setWorkbook(null); setSheetNames([]); setActiveSheet('');
+    setRawSheetData([]); setHeaderRowIndex(0); setFileSizeWarning('');
   };
 
   const selectedColCount = columns.filter(c => c.selected).length;
@@ -612,9 +798,59 @@ Return only the JSON array.`;
 
         {hasData && step === 'pick' && (
           <>
+            {fileSizeWarning && (
+              <div style={{ padding: '8px 20px', background: '#FFF5E5', borderBottom: `0.5px solid ${BRAND.grayLight}`, color: BRAND.warning, fontSize: '12px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <AlertTriangle size={13} />{fileSizeWarning}
+              </div>
+            )}
+
+            {(sheetNames.length > 1 || rawSheetData.length > 0) && (
+              <div style={{ padding: '10px 20px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', gap: '20px', flexWrap: 'wrap', fontSize: '12px' }}>
+                {sheetNames.length > 1 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ color: BRAND.grayDark, fontWeight: 500 }}>Sheet:</span>
+                    <select
+                      value={activeSheet}
+                      onChange={e => switchSheet(e.target.value)}
+                      style={{ fontSize: '12px', padding: '4px 8px', border: `1px solid ${BRAND.grayLight}`, borderRadius: '4px', background: 'white', cursor: 'pointer', fontFamily: 'inherit', minWidth: '140px' }}
+                    >
+                      {sheetNames.map(name => (
+                        <option key={name} value={name}>{name}</option>
+                      ))}
+                    </select>
+                    <span style={{ color: BRAND.grayDark, fontSize: '11px' }}>{sheetNames.length} sheets in this file</span>
+                  </div>
+                )}
+
+                {rawSheetData.length > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ color: BRAND.grayDark, fontWeight: 500 }}>Header row:</span>
+                    <button
+                      onClick={() => changeHeaderRow(Math.max(0, headerRowIndex - 1))}
+                      disabled={headerRowIndex === 0}
+                      style={{ background: 'white', border: `1px solid ${BRAND.grayLight}`, padding: '3px 6px', borderRadius: '4px', cursor: headerRowIndex === 0 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', color: headerRowIndex === 0 ? BRAND.grayMid : BRAND.cyan }}
+                      title="Use previous row as header"
+                    >
+                      <ChevronLeft size={12} />
+                    </button>
+                    <span style={{ fontSize: '12px', color: BRAND.black, fontWeight: 500, minWidth: '52px', textAlign: 'center' }}>Row {headerRowIndex + 1}</span>
+                    <button
+                      onClick={() => changeHeaderRow(Math.min(rawSheetData.length - 2, headerRowIndex + 1))}
+                      disabled={headerRowIndex >= rawSheetData.length - 2}
+                      style={{ background: 'white', border: `1px solid ${BRAND.grayLight}`, padding: '3px 6px', borderRadius: '4px', cursor: headerRowIndex >= rawSheetData.length - 2 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', color: headerRowIndex >= rawSheetData.length - 2 ? BRAND.grayMid : BRAND.cyan }}
+                      title="Use next row as header"
+                    >
+                      <ChevronRight size={12} />
+                    </button>
+                    <span style={{ color: BRAND.grayDark, fontSize: '11px' }}>auto-detected · adjust if title bars are above the headers</span>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div style={{ padding: '12px 20px', borderBottom: `0.5px solid ${BRAND.grayLight}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px' }}>
               <div style={{ minWidth: 0 }}>
-                <p style={{ fontSize: '13px', fontWeight: 500, margin: 0, color: BRAND.black }}>{fileName}</p>
+                <p style={{ fontSize: '13px', fontWeight: 500, margin: 0, color: BRAND.black }}>{fileName}{sheetNames.length > 1 && ` · ${activeSheet}`}</p>
                 <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: '3px 0 0' }}>{columns.length} columns · {rows.length.toLocaleString()} rows · tick what to keep</p>
               </div>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
