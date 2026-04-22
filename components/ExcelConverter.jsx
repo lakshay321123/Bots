@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import {
   Upload, Download, Sparkles, RotateCcw, FileSpreadsheet,
@@ -227,6 +227,12 @@ export default function ExcelConverter() {
   const [targetFileName, setTargetFileName] = useState('');
   const [columnMapping, setColumnMapping] = useState({});  // { sourceColId: { target, confidence, reason } }
   const [mappingLoading, setMappingLoading] = useState(false);
+  // Tracks which match request is currently in-flight so stale responses
+  // (from earlier clicks or sheet switches) can be ignored.
+  const matchRequestIdRef = useRef(0);
+  // Indirection so switchSheet/changeHeaderRow (declared early) can call
+  // runColumnMatch (declared later) without a temporal-dead-zone error.
+  const runColumnMatchRef = useRef(null);
 
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
@@ -338,15 +344,27 @@ export default function ExcelConverter() {
     setCurrentTemplateId(null);
     setMatchedTemplate(null);
     setShowFilters(false);
-    rebuildFromMatrix(matrix, detected);
-  }, [workbook, rebuildFromMatrix]);
+    // Clear any AI mapping — it was bound to the previous sheet's columns
+    setColumnMapping({});
+    const built = rebuildFromMatrix(matrix, detected);
+    // In two-file mode, re-run the AI match against the new sheet's columns
+    if (mode === 'two-file' && targetColumns.length > 0 && built && runColumnMatchRef.current) {
+      runColumnMatchRef.current(built.newColumns, built.newRows, targetColumns);
+    }
+  }, [workbook, rebuildFromMatrix, mode, targetColumns]);
 
   // Manual header-row override (user picks a different row)
   const changeHeaderRow = useCallback((newIdx) => {
     if (!rawSheetData.length) return;
     setHeaderRowIndex(newIdx);
-    rebuildFromMatrix(rawSheetData, newIdx);
-  }, [rawSheetData, rebuildFromMatrix]);
+    // Clear mapping — the new header row yields different originalNames, so the
+    // existing mapping (keyed to old originalNames) is stale
+    setColumnMapping({});
+    const built = rebuildFromMatrix(rawSheetData, newIdx);
+    if (mode === 'two-file' && targetColumns.length > 0 && built && runColumnMatchRef.current) {
+      runColumnMatchRef.current(built.newColumns, built.newRows, targetColumns);
+    }
+  }, [rawSheetData, rebuildFromMatrix, mode, targetColumns]);
 
   // Apply an AI mapping result: select matched source cols, rename to target names,
   // order them to match the target file's column order, drop everything else.
@@ -380,22 +398,31 @@ export default function ExcelConverter() {
       return { ...c, selected: false, displayName: c.originalName };
     });
 
-    // Build new outputOrder: target order first (only mapped ones), then unmapped at end
+    // Build new outputOrder: target order first (only mapped ones), then unmapped at end.
+    // Normalize trim on BOTH sides consistently, and dedupe so one source col
+    // can't end up in outputOrder twice if Claude maps it to multiple targets.
     const targetToSourceColId = {};
     mappings.forEach(m => {
       if (!m.source) return;
+      const normalizedSource = String(m.source).trim().toLowerCase();
+      const normalizedTarget = String(m.target).trim().toLowerCase();
       const col = updated.find(c =>
-        c.originalName.toLowerCase() === String(m.source).trim().toLowerCase() ||
-        c.displayName.toLowerCase() === String(m.source).trim().toLowerCase() ||
-        c.displayName.toLowerCase() === String(m.target).trim().toLowerCase()
+        String(c.originalName).trim().toLowerCase() === normalizedSource ||
+        String(c.displayName).trim().toLowerCase() === normalizedSource ||
+        String(c.displayName).trim().toLowerCase() === normalizedTarget
       );
       if (col) targetToSourceColId[m.target] = col.id;
     });
+    const seen = new Set();
     const orderedIds = mappings
       .map(m => targetToSourceColId[m.target])
-      .filter(Boolean);
+      .filter(id => {
+        if (!id || seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
     const remainingIds = updated
-      .filter(c => !orderedIds.includes(c.id))
+      .filter(c => !seen.has(c.id))
       .map(c => c.id);
 
     // Build a per-column mapping lookup for confidence pills
@@ -412,6 +439,8 @@ export default function ExcelConverter() {
 
   // Run the AI mapping: source columns × target columns → mapping
   const runColumnMatch = useCallback(async (sourceColumns, sourceRows, targets) => {
+    // Bump the request id; this request's response is only applied if it's still current.
+    const requestId = ++matchRequestIdRef.current;
     setMappingLoading(true);
     setError('');
     try {
@@ -422,11 +451,14 @@ export default function ExcelConverter() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sourceColumns: sourceNames, targetColumns: targets, sampleRows }),
       });
+      // If another match started while this one was in flight, discard.
+      if (requestId !== matchRequestIdRef.current) return;
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         throw new Error(errBody.error || `HTTP ${res.status}`);
       }
       const data = await res.json();
+      if (requestId !== matchRequestIdRef.current) return;
       if (!data.mappings || !Array.isArray(data.mappings)) {
         throw new Error('No mappings returned');
       }
@@ -439,17 +471,36 @@ export default function ExcelConverter() {
       );
       setTimeout(() => setSuccessMessage(''), 5000);
     } catch (err) {
-      setError(`Auto-match failed: ${err.message}. You can still pick columns manually.`);
+      // Only surface error if this is still the active request
+      if (requestId === matchRequestIdRef.current) {
+        setError(`Auto-match failed: ${err.message}. You can still pick columns manually.`);
+      }
     } finally {
-      setMappingLoading(false);
+      if (requestId === matchRequestIdRef.current) {
+        setMappingLoading(false);
+      }
     }
   }, [applyMapping]);
+
+  // Keep the ref pointing at the latest runColumnMatch so earlier-declared
+  // callbacks (switchSheet, changeHeaderRow) can invoke it.
+  useEffect(() => {
+    runColumnMatchRef.current = runColumnMatch;
+  }, [runColumnMatch]);
 
   // Upload the format file (just headers), then if source is already loaded, run the match
   const handleFormatFileUpload = useCallback(async (e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
     setError('');
+
+    // Format files should be tiny — just headers. 10 MB is already generous.
+    const sizeMb = file.size / (1024 * 1024);
+    if (sizeMb > 10) {
+      setError(`Format file is ${sizeMb.toFixed(1)} MB. Format files should contain only column headers — did you upload the wrong file?`);
+      return;
+    }
+
     setTargetFileName(file.name);
 
     try {
@@ -1008,7 +1059,7 @@ Return only the JSON array.`;
                     <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', letterSpacing: '0.5px', textTransform: 'uppercase', fontWeight: 500 }}>Step 1 · Target format</p>
                     {targetColumns.length === 0 ? (
                       <label
-                        style={{ display: 'block', padding: '32px 20px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s', minHeight: '200px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px 20px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s', minHeight: '200px' }}
                         onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
                         onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
                       >
@@ -1048,7 +1099,7 @@ Return only the JSON array.`;
                   <div>
                     <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', letterSpacing: '0.5px', textTransform: 'uppercase', fontWeight: 500 }}>Step 2 · Your messy file</p>
                     <label
-                      style={{ display: 'block', padding: '32px 20px', border: `2px dashed ${targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid}`, borderRadius: '12px', background: targetColumns.length > 0 ? BRAND.cyanLight + '50' : BRAND.surface, textAlign: 'center', cursor: targetColumns.length > 0 ? 'pointer' : 'not-allowed', opacity: targetColumns.length > 0 ? 1 : 0.5, minHeight: '200px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+                      style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px 20px', border: `2px dashed ${targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid}`, borderRadius: '12px', background: targetColumns.length > 0 ? BRAND.cyanLight + '50' : BRAND.surface, textAlign: 'center', cursor: targetColumns.length > 0 ? 'pointer' : 'not-allowed', opacity: targetColumns.length > 0 ? 1 : 0.5, minHeight: '200px' }}
                     >
                       <Upload size={28} color={targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid} strokeWidth={1.5} style={{ marginBottom: '10px' }} />
                       <p style={{ fontSize: '14px', fontWeight: 500, color: BRAND.black, margin: '0 0 4px' }}>Your data file</p>

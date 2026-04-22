@@ -59,29 +59,49 @@ Return ONLY a JSON object in this exact shape, no preamble or markdown:
 Every target column must have an entry, in the same order as the TARGET list above.
 Each "source" value must EXACTLY match one of the SOURCE column names above (or be null).`;
 
-    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5-20250929',
-        max_tokens: 4000,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
+    // Abort the upstream request if Claude takes longer than 60s so the
+    // Node worker doesn't hang indefinitely.
+    const controller = new AbortController();
+    const timeoutMs = 60000;
+    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+    let upstream;
+    try {
+      upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 4000,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        signal: controller.signal,
+      });
+    } catch (fetchErr) {
+      if (fetchErr?.name === 'AbortError') {
+        return Response.json({ error: `Claude did not respond within ${timeoutMs / 1000}s. Try again.` }, { status: 504 });
+      }
+      throw fetchErr;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
 
     if (!upstream.ok) {
-      const errText = await upstream.text();
-      return Response.json({ error: `Claude API ${upstream.status}: ${errText.slice(0, 200)}` }, { status: 502 });
+      // Log upstream body server-side for debugging, but never echo it back to the client —
+      // Claude may have mirrored prompt content (which contains PHI sample values).
+      const errText = await upstream.text().catch(() => '');
+      console.error('[match-columns] upstream error', upstream.status, errText.slice(0, 500));
+      return Response.json({ error: `Claude API returned ${upstream.status}` }, { status: 502 });
     }
 
     const data = await upstream.json();
     const textBlock = (data.content || []).find(b => b.type === 'text');
     if (!textBlock) {
-      return Response.json({ error: 'no text response from Claude' }, { status: 502 });
+      return Response.json({ error: 'No text response from Claude' }, { status: 502 });
     }
 
     const cleaned = textBlock.text.trim()
@@ -94,15 +114,39 @@ Each "source" value must EXACTLY match one of the SOURCE column names above (or 
     try {
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      return Response.json({ error: 'Claude returned invalid JSON', raw: cleaned.slice(0, 300) }, { status: 502 });
+      // Don't echo `cleaned` back — it can contain PHI from the prompt samples.
+      console.error('[match-columns] Claude returned invalid JSON. First 300 chars:', cleaned.slice(0, 300));
+      return Response.json({ error: 'Claude returned invalid JSON' }, { status: 502 });
     }
 
     if (!parsed.mappings || !Array.isArray(parsed.mappings)) {
-      return Response.json({ error: 'response missing mappings array' }, { status: 502 });
+      return Response.json({ error: 'Response missing mappings array' }, { status: 502 });
     }
 
-    return Response.json({ mappings: parsed.mappings });
+    // Validate each mapping has the expected shape before returning.
+    // The client's applyMapping assumes target/source/confidence/reason.
+    const validMappings = parsed.mappings.every(m =>
+      m && typeof m === 'object' &&
+      typeof m.target === 'string' && m.target.length > 0 &&
+      (m.source === null || typeof m.source === 'string') &&
+      (typeof m.confidence === 'number' || m.confidence === undefined)
+    );
+    if (!validMappings) {
+      console.error('[match-columns] malformed mapping items', JSON.stringify(parsed.mappings).slice(0, 300));
+      return Response.json({ error: 'Claude returned malformed mapping items' }, { status: 502 });
+    }
+
+    // Normalize: ensure confidence is a number in [0,1] and reason is a string
+    const normalized = parsed.mappings.map(m => ({
+      target: m.target,
+      source: m.source || null,
+      confidence: typeof m.confidence === 'number' ? Math.max(0, Math.min(1, m.confidence)) : 0,
+      reason: typeof m.reason === 'string' ? m.reason : '',
+    }));
+
+    return Response.json({ mappings: normalized });
   } catch (err) {
-    return Response.json({ error: String(err?.message || err) }, { status: 500 });
+    console.error('[match-columns] unexpected error', err);
+    return Response.json({ error: 'Server error while matching columns' }, { status: 500 });
   }
 }
