@@ -200,6 +200,110 @@ async function readFileAsText(file) {
   return new TextDecoder('utf-8').decode(buf);
 }
 
+// Resize handle — drag to adjust the table height.
+// Calls onResize(absoluteHeight) where absoluteHeight = startHeight + deltaY
+// Height bounds for the resizable table — also used as ARIA min/max
+// on the resize separator so screen readers announce the range.
+const TABLE_HEIGHT_MIN = 240;
+const TABLE_HEIGHT_MAX = 1400;
+
+function ResizeHandle({ currentHeight, getStartHeight, onResize, min = TABLE_HEIGHT_MIN, max = TABLE_HEIGHT_MAX }) {
+  // Visible focus ring is a separate state instead of relying on :focus-visible
+  // CSS — this component uses inline styles, so toggling React state is the
+  // cleanest way to give keyboard users a visible focus indicator without
+  // adding a global stylesheet.
+  const [hasFocus, setHasFocus] = useState(false);
+  // Keep a reference to the active drag's cleanup function so we can
+  // invoke it if the component unmounts mid-drag (prevents document.body
+  // from getting stuck with ns-resize cursor and no text selection).
+  const cleanupRef = useRef(() => {});
+  useEffect(() => () => cleanupRef.current(), []);
+
+  const startDrag = (e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = getStartHeight();
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    const onMove = (ev) => onResize(startHeight + (ev.clientY - startY));
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', cleanup);
+      window.removeEventListener('pointercancel', cleanup);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      cleanupRef.current = () => {};
+    };
+    cleanupRef.current = cleanup;
+    // setPointerCapture routes subsequent pointer events to this element
+    // even if the pointer leaves the browser window (fixes stuck-state bug)
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch {}
+    document.body.style.cursor = 'ns-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', cleanup, { once: true });
+    window.addEventListener('pointercancel', cleanup, { once: true });
+  };
+
+  const handleKeyDown = (e) => {
+    // Keyboard accessibility — Arrow keys nudge, Page keys jump, Home/End extremes
+    const step = e.shiftKey ? 48 : 24;
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      onResize(getStartHeight() - step);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      onResize(getStartHeight() + step);
+    } else if (e.key === 'PageUp') {
+      e.preventDefault();
+      onResize(getStartHeight() - 120);
+    } else if (e.key === 'PageDown') {
+      e.preventDefault();
+      onResize(getStartHeight() + 120);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      onResize(min);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      onResize(max);
+    }
+  };
+
+  return (
+    <div
+      role="separator"
+      aria-label="Resize table height"
+      aria-orientation="horizontal"
+      aria-valuenow={currentHeight}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      onPointerDown={startDrag}
+      onKeyDown={handleKeyDown}
+      onFocus={() => setHasFocus(true)}
+      onBlur={() => setHasFocus(false)}
+      title="Drag to resize the table (or use arrow keys, Home/End for min/max)"
+      style={{
+        height: '8px',
+        cursor: 'ns-resize',
+        // Keyboard focus indicator: a 2px cyan inset shadow so the user can
+        // see which element has focus. Inline so we don't need a stylesheet.
+        background: hasFocus ? '#D6EBF2' : '#F5F7F8',
+        borderTop: '0.5px solid #E6E6E6',
+        borderBottom: '0.5px solid #E6E6E6',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        touchAction: 'none',
+        outline: hasFocus ? '2px solid #00B5D6' : 'none',
+        outlineOffset: '-2px',
+      }}
+    >
+      <div style={{ width: '40px', height: '3px', background: hasFocus ? '#00B5D6' : '#CCCCCC', borderRadius: '2px' }} />
+    </div>
+  );
+}
+
 export default function ExcelConverter() {
   const [fileName, setFileName] = useState('');
   const [columns, setColumns] = useState([]);
@@ -220,6 +324,22 @@ export default function ExcelConverter() {
   const [rawSheetData, setRawSheetData] = useState([]);    // raw rows incl. pre-header noise
   const [headerRowIndex, setHeaderRowIndex] = useState(0); // which row is the header (0-based)
   const [fileSizeWarning, setFileSizeWarning] = useState('');
+  const [tableHeight, setTableHeight] = useState(520); // user-resizable; pixels
+  // Is the viewport narrow enough that we should stack the landing preview cards?
+  const [isNarrow, setIsNarrow] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 768px)');
+    const update = () => setIsNarrow(mq.matches);
+    update();
+    if (mq.addEventListener) {
+      mq.addEventListener('change', update);
+      return () => mq.removeEventListener('change', update);
+    }
+    // Safari < 14 fallback
+    mq.addListener(update);
+    return () => mq.removeListener(update);
+  }, []);
 
   // Two-file format-matching mode
   const [mode, setMode] = useState(null);                  // null = unset, 'one-file' or 'two-file'
@@ -558,6 +678,13 @@ export default function ExcelConverter() {
       setError(`Could not read format file: ${err.message || 'invalid Excel/CSV'}`);
     }
   }, [columns, rows, runColumnMatch]);
+
+  // Resize handle: clamp between 240 and 1400 px so it always stays usable
+  const handleTableResize = useCallback((newHeight) => {
+    if (newHeight < TABLE_HEIGHT_MIN) newHeight = TABLE_HEIGHT_MIN;
+    if (newHeight > TABLE_HEIGHT_MAX) newHeight = TABLE_HEIGHT_MAX;
+    setTableHeight(newHeight);
+  }, []);
 
   const handleFileUpload = useCallback(async (e) => {
     const file = e.target.files && e.target.files[0];
@@ -996,53 +1123,153 @@ Return only the JSON array.`;
 
             {/* Mode picker — shown until user chooses */}
             {mode === null && (
-              <div style={{ maxWidth: '780px', margin: '0 auto' }}>
-                <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>How do you want to start?</p>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-                  <button
-                    onClick={() => setMode('one-file')}
-                    style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit' }}
-                    onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
-                      <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <FileSpreadsheet size={18} color={BRAND.cyan} />
+              <>
+                <div style={{ maxWidth: '780px', margin: '0 auto' }}>
+                  <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>How do you want to start?</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                    <button
+                      onClick={() => setMode('one-file')}
+                      style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                        <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <FileSpreadsheet size={18} color={BRAND.cyan} />
+                        </div>
+                        <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>One file · Manual</p>
                       </div>
-                      <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>One file · Manual</p>
-                    </div>
-                    <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
-                      Upload your messy file. Pick the columns you want, rename them, filter rows, save as a template for next time.
-                    </p>
-                    <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you're building a new template →</p>
-                  </button>
+                      <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
+                        Upload your messy file. Pick the columns you want, rename them, filter rows, save as a template for next time.
+                      </p>
+                      <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you're building a new template →</p>
+                    </button>
 
-                  <button
-                    onClick={() => setMode('two-file')}
-                    style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit', position: 'relative' }}
-                    onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
-                  >
-                    <span style={{ position: 'absolute', top: '12px', right: '12px', fontSize: '9px', fontWeight: 600, color: 'white', background: BRAND.cyan, padding: '2px 8px', borderRadius: '10px', letterSpacing: '0.5px' }}>NEW · AI</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
-                      <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <Sparkles size={18} color={BRAND.cyan} />
+                    <button
+                      onClick={() => setMode('two-file')}
+                      style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit', position: 'relative' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
+                    >
+                      <span style={{ position: 'absolute', top: '12px', right: '12px', fontSize: '9px', fontWeight: 600, color: 'white', background: BRAND.cyan, padding: '2px 8px', borderRadius: '10px', letterSpacing: '0.5px' }}>NEW · AI</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                        <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <Sparkles size={18} color={BRAND.cyan} />
+                        </div>
+                        <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>Two files · Auto-match</p>
                       </div>
-                      <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>Two files · Auto-match</p>
-                    </div>
-                    <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
-                      Drop your messy file <em>plus</em> a target format file (just headers needed). AI maps the columns automatically.
+                      <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
+                        Drop your messy file <em>plus</em> a target format file (just headers needed). AI maps the columns automatically.
+                      </p>
+                      <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you have a target format →</p>
+                    </button>
+                  </div>
+
+                  {templates.length > 0 && (
+                    <p style={{ fontSize: '12px', color: BRAND.grayDark, textAlign: 'center', marginTop: '20px' }}>
+                      Or pick a saved template after uploading.
                     </p>
-                    <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you have a target format →</p>
-                  </button>
+                  )}
                 </div>
 
-                {templates.length > 0 && (
-                  <p style={{ fontSize: '12px', color: BRAND.grayDark, textAlign: 'center', marginTop: '20px' }}>
-                    Or pick a saved template after uploading.
-                  </p>
-                )}
-              </div>
+                {/* Sample input → output preview (visible on landing so users see what Zeus does) */}
+                <div style={{ maxWidth: '1100px', margin: '40px auto 0' }}>
+                  <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>What Zeus does</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+                    {/* Input side */}
+                    <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.grayLight}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+                      <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div>
+                          <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample input</p>
+                          <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export.xlsx</p>
+                        </div>
+                        <span style={{ fontSize: '10px', color: BRAND.grayDark }}>5 cols · messy</span>
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%', fontFamily: 'ui-monospace, monospace' }}>
+                          <thead>
+                            <tr>
+                              {['PT_FNAME', 'PT_LNAME', 'DOB_RAW', 'MRN_ID', '_temp'].map(h => (
+                                <th key={h} style={{ background: BRAND.surface, padding: '6px 8px', textAlign: 'left', color: BRAND.grayDark, fontWeight: 500, fontSize: '10px', borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap' }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[
+                              ['john', 'CASTILLO', '5/20/85', 'a12345', '---'],
+                              ['MARIA', 'lopez', '11-3-72', 'A98102', 'x'],
+                              ['David ', ' Chen', '02/14/90', ' a33871', ''],
+                              ['Priya', 'PATEL', '7/22/88', 'A55019', 'NULL'],
+                              ['', 'Williams', '9/15/65', 'a71234', ''],
+                            ].map((row, i) => (
+                              <tr key={i}>
+                                {row.map((cell, j) => (
+                                  <td key={j} style={{ padding: '5px 8px', color: BRAND.grayDark, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px' }}>
+                                    {cell || <span style={{ color: BRAND.grayMid }}>—</span>}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Arrow — rotates 90° when the grid stacks vertically */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
+                      <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: BRAND.cyan, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
+                        <ArrowRight size={16} />
+                      </div>
+                    </div>
+
+                    {/* Output side */}
+                    <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.cyan}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 2px 8px rgba(0, 181, 214, 0.12)' }}>
+                      <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div>
+                          <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black }}>Sample output</p>
+                          <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '2px 0 0', fontFamily: 'ui-monospace, monospace' }}>athena_export_zeus_output.xlsx</p>
+                        </div>
+                        <span style={{ fontSize: '10px', color: BRAND.cyan, fontWeight: 500 }}>4 cols · clean</span>
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ borderCollapse: 'collapse', fontSize: '10px', width: '100%' }}>
+                          <thead>
+                            <tr>
+                              {['First Name', 'Last Name', 'Date of Birth', 'MRN'].map(h => (
+                                <th key={h} style={{ background: BRAND.cyan, padding: '6px 8px', textAlign: 'left', color: 'white', fontWeight: 500, fontSize: '10px', whiteSpace: 'nowrap' }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[
+                              ['John', 'Castillo', '1985-05-20', 'A12345'],
+                              ['Maria', 'Lopez', '1972-11-03', 'A98102'],
+                              ['David', 'Chen', '1990-02-14', 'A33871'],
+                              ['Priya', 'Patel', '1988-07-22', 'A55019'],
+                            ].map((row, i) => (
+                              <tr key={i}>
+                                {row.map((cell, j) => (
+                                  <td key={j} style={{ padding: '5px 8px', color: BRAND.black, borderBottom: `0.5px solid ${BRAND.grayLight}`, whiteSpace: 'nowrap', fontSize: '10px', fontFamily: j === 2 || j === 3 ? 'ui-monospace, monospace' : 'inherit' }}>
+                                    {cell}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'center', gap: '24px', flexWrap: 'wrap', fontSize: '11px', color: BRAND.grayDark }}>
+                    <span>✓ Renamed: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>PT_FNAME → First Name</code></span>
+                    <span>✓ Dates: <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>5/20/85 → 1985-05-20</code></span>
+                    <span>✓ Trimmed whitespace</span>
+                    <span>✓ Dropped junk column <code style={{ background: BRAND.surface, padding: '1px 5px', borderRadius: '3px', fontSize: '10px' }}>_temp</code></span>
+                    <span>✓ Filtered row missing first name</span>
+                  </div>
+                </div>
+              </>
             )}
 
             {/* One-file mode dropzone */}
@@ -1075,7 +1302,7 @@ Return only the JSON array.`;
                   </button>
                 </div>
 
-                <div style={{ maxWidth: '900px', margin: '0 auto', display: 'grid', gridTemplateColumns: '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+                <div style={{ maxWidth: '900px', margin: '0 auto', display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
 
                   {/* Step 1: Format/target file */}
                   <div>
@@ -1111,9 +1338,9 @@ Return only the JSON array.`;
                     )}
                   </div>
 
-                  {/* Arrow between */}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: targetColumns.length > 0 ? BRAND.cyan : BRAND.grayLight, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.2s' }}>
+                  {/* Arrow between — rotates when stacked on narrow viewports */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
+                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: targetColumns.length > 0 ? BRAND.cyan : BRAND.grayLight, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.2s', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
                       <ArrowRight size={16} />
                     </div>
                   </div>
@@ -1398,11 +1625,11 @@ Return only the JSON array.`;
               </div>
             )}
 
-            <div style={{ overflowX: 'auto', maxHeight: '55vh', overflowY: 'auto', background: BRAND.white }}>
-              <table style={{ borderCollapse: 'collapse', fontSize: '11px', fontFamily: 'inherit' }}>
+            <div style={{ overflowX: 'auto', height: `${tableHeight}px`, overflowY: 'auto', background: BRAND.white }}>
+              <table style={{ borderCollapse: 'separate', borderSpacing: 0, fontSize: '11px', fontFamily: 'inherit' }}>
                 <thead>
-                  <tr>
-                    <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '6px 4px', width: '44px', minWidth: '44px', position: 'sticky', left: 0, top: 0, zIndex: 3 }}></th>
+                  <tr style={{ height: '36px' }}>
+                    <th style={{ background: BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '6px 4px', width: '44px', minWidth: '44px', position: 'sticky', left: 0, top: 0, zIndex: 4, height: '36px', boxSizing: 'border-box' }}></th>
                     {pickCols.map((col, i) => {
                       const isFirst = i === 0;
                       const isLast = i === pickCols.length - 1;
@@ -1412,7 +1639,7 @@ Return only the JSON array.`;
                         : mapEntry.confidence >= 0.6 ? '#C57300'   // amber
                         : BRAND.danger;                            // red
                       return (
-                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2 }}>
+                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2, height: '36px', boxSizing: 'border-box' }}>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
                             <input type="checkbox" checked={col.selected} onChange={() => toggleColumn(col.id)} style={{ accentColor: BRAND.cyan, width: '14px', height: '14px', margin: 0, cursor: 'pointer', flexShrink: 0 }} />
                             <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
@@ -1435,26 +1662,26 @@ Return only the JSON array.`;
                       );
                     })}
                   </tr>
-                  <tr>
-                    <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '5px 4px', textAlign: 'center', fontSize: '10px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 31, zIndex: 3 }}>name</th>
+                  <tr style={{ height: '32px' }}>
+                    <th style={{ background: BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '5px 4px', textAlign: 'center', fontSize: '10px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 36, zIndex: 4, height: '32px', boxSizing: 'border-box' }}>name</th>
                     {pickCols.map(col => (
-                      <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', textAlign: 'left', position: 'sticky', top: 31, zIndex: 2 }}>
+                      <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', textAlign: 'left', position: 'sticky', top: 36, zIndex: 2, height: '32px', boxSizing: 'border-box' }}>
                         <input type="text" value={col.displayName} onChange={e => updateColumnName(col.id, e.target.value)} disabled={!col.selected} style={{ width: '100%', border: 'none', background: 'transparent', fontSize: '11px', fontWeight: 500, color: col.selected ? BRAND.black : BRAND.grayMid, padding: '3px 2px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }} title={`Source: ${col.originalName}`} />
                       </th>
                     ))}
                   </tr>
-                  <tr>
-                    <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 4px', textAlign: 'center', fontSize: '9px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 62, zIndex: 3 }}>stats</th>
+                  <tr style={{ height: '28px' }}>
+                    <th style={{ background: BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 4px', textAlign: 'center', fontSize: '9px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 68, zIndex: 4, height: '28px', boxSizing: 'border-box' }}>stats</th>
                     {pickCols.map(col => {
                       const p = columnProfiles[col.id];
-                      if (!p) return <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', position: 'sticky', top: 62, zIndex: 2 }}></th>;
+                      if (!p) return <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', position: 'sticky', top: 68, zIndex: 2, height: '28px', boxSizing: 'border-box' }}></th>;
                       const emptyColor = p.emptyPct >= 50 ? BRAND.warning : p.emptyPct >= 20 ? BRAND.grayDark : BRAND.cyan;
                       return (
-                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 8px', textAlign: 'left', position: 'sticky', top: 62, zIndex: 2, fontWeight: 400 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '9px', color: BRAND.grayDark, flexWrap: 'wrap' }}>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }}><TypeIcon type={p.type} /> {p.type}</span>
-                            <span style={{ color: emptyColor }}>{p.emptyPct}% empty</span>
-                            <span>{p.uniqueCount.toLocaleString()} unique</span>
+                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 8px', textAlign: 'left', position: 'sticky', top: 68, zIndex: 2, fontWeight: 400, height: '28px', boxSizing: 'border-box', overflow: 'hidden' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '9px', color: BRAND.grayDark, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '2px', flexShrink: 0 }}><TypeIcon type={p.type} /> {p.type}</span>
+                            <span style={{ color: emptyColor, flexShrink: 0 }}>{p.emptyPct}% empty</span>
+                            <span style={{ flexShrink: 0 }}>{p.uniqueCount.toLocaleString()} unique</span>
                           </div>
                         </th>
                       );
@@ -1467,7 +1694,7 @@ Return only the JSON array.`;
                     const rowDimmed = !row.selected || !passesFilter;
                     return (
                       <tr key={row.index}>
-                        <td style={{ background: rowDimmed ? '#FAFAFA' : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '3px 4px', position: 'sticky', left: 0, zIndex: 1, width: '44px' }}>
+                        <td style={{ background: rowDimmed ? '#FAFAFA' : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '3px 4px', position: 'sticky', left: 0, zIndex: 1, width: '44px' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '4px', justifyContent: 'space-between' }}>
                             <input type="checkbox" checked={row.selected} onChange={() => toggleRow(row.index)} style={{ accentColor: BRAND.cyan, width: '12px', height: '12px', margin: 0, cursor: 'pointer' }} />
                             <span style={{ fontSize: '10px', color: passesFilter ? BRAND.grayDark : BRAND.warning }}>{i + 2}</span>
@@ -1478,7 +1705,7 @@ Return only the JSON array.`;
                           const isEmpty = val === '' || val === null || val === undefined;
                           const dimmed = !col.selected || rowDimmed;
                           return (
-                            <td key={col.id} style={{ border: `0.5px solid ${BRAND.grayLight}`, padding: '6px 10px', color: dimmed ? BRAND.grayMid : (isEmpty ? BRAND.grayMid : BRAND.black), background: dimmed ? '#FAFAFA' : BRAND.white, whiteSpace: 'nowrap', maxWidth: '280px', overflow: 'hidden', textOverflow: 'ellipsis', opacity: dimmed ? 0.55 : 1 }}>
+                            <td key={col.id} style={{ borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '6px 10px', color: dimmed ? BRAND.grayMid : (isEmpty ? BRAND.grayMid : BRAND.black), background: dimmed ? '#FAFAFA' : BRAND.white, whiteSpace: 'nowrap', maxWidth: '280px', overflow: 'hidden', textOverflow: 'ellipsis', opacity: dimmed ? 0.55 : 1 }}>
                               {isEmpty ? '—' : String(val)}
                             </td>
                           );
@@ -1489,6 +1716,8 @@ Return only the JSON array.`;
                 </tbody>
               </table>
             </div>
+
+            <ResizeHandle currentHeight={tableHeight} getStartHeight={() => tableHeight} onResize={handleTableResize} />
 
             {rows.length > 100 && (
               <div style={{ padding: '8px 20px', background: BRAND.cyanLight + '80', borderTop: `0.5px solid ${BRAND.grayLight}`, fontSize: '11px', color: BRAND.grayDark, textAlign: 'center' }}>
@@ -1553,7 +1782,7 @@ Return only the JSON array.`;
               </div>
             </div>
 
-            <div style={{ overflowX: 'auto', maxHeight: '55vh', overflowY: 'auto', background: BRAND.white }}>
+            <div style={{ overflowX: 'auto', height: `${tableHeight}px`, overflowY: 'auto', background: BRAND.white }}>
               <table style={{ borderCollapse: 'collapse', fontSize: '11px', fontFamily: 'inherit' }}>
                 <thead>
                   <tr>
@@ -1584,6 +1813,8 @@ Return only the JSON array.`;
                 </tbody>
               </table>
             </div>
+
+            <ResizeHandle currentHeight={tableHeight} getStartHeight={() => tableHeight} onResize={handleTableResize} />
 
             {effectivelySelectedRows.length > 100 && (
               <div style={{ padding: '8px 20px', background: BRAND.cyanLight + '80', borderTop: `0.5px solid ${BRAND.grayLight}`, fontSize: '11px', color: BRAND.grayDark, textAlign: 'center' }}>
