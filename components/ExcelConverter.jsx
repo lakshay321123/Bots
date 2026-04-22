@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import {
   Upload, Download, Sparkles, RotateCcw, FileSpreadsheet,
@@ -203,26 +203,65 @@ async function readFileAsText(file) {
 // Resize handle — drag to adjust the table height.
 // Calls onResize(absoluteHeight) where absoluteHeight = startHeight + deltaY
 function ResizeHandle({ getStartHeight, onResize }) {
+  // Keep a reference to the active drag's cleanup function so we can
+  // invoke it if the component unmounts mid-drag (prevents document.body
+  // from getting stuck with ns-resize cursor and no text selection).
+  const cleanupRef = useRef(() => {});
+  useEffect(() => () => cleanupRef.current(), []);
+
   const startDrag = (e) => {
     e.preventDefault();
     const startY = e.clientY;
     const startHeight = getStartHeight();
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
     const onMove = (ev) => onResize(startHeight + (ev.clientY - startY));
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', cleanup);
+      window.removeEventListener('pointercancel', cleanup);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      cleanupRef.current = () => {};
     };
+    cleanupRef.current = cleanup;
+    // setPointerCapture routes subsequent pointer events to this element
+    // even if the pointer leaves the browser window (fixes stuck-state bug)
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch {}
     document.body.style.cursor = 'ns-resize';
     document.body.style.userSelect = 'none';
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', cleanup, { once: true });
+    window.addEventListener('pointercancel', cleanup, { once: true });
   };
+
+  const handleKeyDown = (e) => {
+    // Keyboard accessibility — Arrow keys nudge, Page/Home/End jump
+    const step = e.shiftKey ? 48 : 24;
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      onResize(getStartHeight() - step);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      onResize(getStartHeight() + step);
+    } else if (e.key === 'PageUp') {
+      e.preventDefault();
+      onResize(getStartHeight() - 120);
+    } else if (e.key === 'PageDown') {
+      e.preventDefault();
+      onResize(getStartHeight() + 120);
+    }
+  };
+
   return (
     <div
-      onMouseDown={startDrag}
-      title="Drag to resize the table"
+      role="separator"
+      aria-label="Resize table height"
+      aria-orientation="horizontal"
+      tabIndex={0}
+      onPointerDown={startDrag}
+      onKeyDown={handleKeyDown}
+      title="Drag to resize the table (or use arrow keys)"
       style={{
         height: '8px',
         cursor: 'ns-resize',
@@ -232,6 +271,8 @@ function ResizeHandle({ getStartHeight, onResize }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
+        touchAction: 'none',
+        outline: 'none',
       }}
     >
       <div style={{ width: '40px', height: '3px', background: '#CCCCCC', borderRadius: '2px' }} />
@@ -260,6 +301,21 @@ export default function ExcelConverter() {
   const [headerRowIndex, setHeaderRowIndex] = useState(0); // which row is the header (0-based)
   const [fileSizeWarning, setFileSizeWarning] = useState('');
   const [tableHeight, setTableHeight] = useState(520); // user-resizable; pixels
+  // Is the viewport narrow enough that we should stack the landing preview cards?
+  const [isNarrow, setIsNarrow] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 768px)');
+    const update = () => setIsNarrow(mq.matches);
+    update();
+    if (mq.addEventListener) {
+      mq.addEventListener('change', update);
+      return () => mq.removeEventListener('change', update);
+    }
+    // Safari < 14 fallback
+    mq.addListener(update);
+    return () => mq.removeListener(update);
+  }, []);
 
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
@@ -813,7 +869,7 @@ Return only the JSON array.`;
             {/* Sample input → output preview */}
             <div style={{ maxWidth: '1100px', margin: '40px auto 0' }}>
               <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>What Zeus does</p>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? '1fr' : '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
                 {/* Input side */}
                 <div style={{ background: BRAND.white, border: `0.5px solid ${BRAND.grayLight}`, borderRadius: '10px', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
                   <div style={{ padding: '10px 14px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -853,9 +909,9 @@ Return only the JSON array.`;
                   </div>
                 </div>
 
-                {/* Arrow */}
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: BRAND.cyan, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {/* Arrow — rotates 90° when the grid stacks vertically */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: isNarrow ? '4px 0' : 0 }}>
+                  <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: BRAND.cyan, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transform: isNarrow ? 'rotate(90deg)' : 'none' }}>
                     <ArrowRight size={16} />
                   </div>
                 </div>
