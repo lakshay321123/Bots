@@ -180,6 +180,18 @@ export default function ExcelConverter() {
 
   useEffect(() => { loadTemplates(); }, [loadTemplates]);
 
+  // Keep outputOrder in sync with columns: add any new col ids, drop any that no longer exist
+  useEffect(() => {
+    if (columns.length === 0) return;
+    const colIds = columns.map(c => c.id);
+    setOutputOrder(prev => {
+      const kept = prev.filter(id => colIds.includes(id));
+      const missing = colIds.filter(id => !kept.includes(id));
+      if (missing.length === 0 && kept.length === prev.length) return prev;
+      return [...kept, ...missing];
+    });
+  }, [columns]);
+
   const handleFileUpload = useCallback(async (e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
@@ -234,6 +246,7 @@ export default function ExcelConverter() {
       setColumns(newColumns);
       setRows(newRows);
       setColumnProfiles(profiles);
+      setOutputOrder(newColumns.map(c => c.id));
 
       const signature = hashColumnSignature(newColumns.map(c => c.originalName));
       const currentTemplates = await loadTemplates();
@@ -507,7 +520,10 @@ Return only the JSON array.`;
   const selectedRowsRaw = rows.filter(r => r.selected);
   const hasData = columns.length > 0;
   const displayRows = rows.slice(0, 100);
-  const outputCols = outputOrder.map(id => columns.find(c => c.id === id)).filter(Boolean);
+  // Page 1: render ALL columns in outputOrder (selected or not; unselected shown dimmed)
+  const pickCols = outputOrder.map(id => columns.find(c => c.id === id)).filter(Boolean);
+  // Page 2: only selected columns in outputOrder — this is the final file
+  const outputCols = pickCols.filter(c => c.selected);
   const outputBaseName = fileName.replace(/\.(xlsx|xls|csv)$/i, '');
   const currentTemplate = currentTemplateId ? templates.find(t => t.id === currentTemplateId) : null;
   const filteredRowCount = rowsPassingFilters ? rowsPassingFilters.size : rows.length;
@@ -600,9 +616,6 @@ Return only the JSON array.`;
                 <button onClick={aiSuggestNames} disabled={aiLoading || selectedColCount === 0} style={{ background: 'white', color: BRAND.cyan, border: `1px solid ${BRAND.cyan}`, padding: '7px 12px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (aiLoading || selectedColCount === 0) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (aiLoading || selectedColCount === 0) ? 0.5 : 1 }}>
                   <Sparkles size={13} />{aiLoading ? '...' : 'AI names'}
                 </button>
-                <button onClick={openSaveDialog} disabled={selectedColCount === 0} style={{ background: 'white', color: BRAND.grayDark, border: `1px solid ${BRAND.grayLight}`, padding: '7px 12px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: selectedColCount === 0 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: selectedColCount === 0 ? 0.5 : 1 }}>
-                  <Save size={13} />{currentTemplate ? 'Update template' : 'Save as template'}
-                </button>
                 <button onClick={reset} style={{ background: 'white', color: BRAND.grayDark, border: `1px solid ${BRAND.grayLight}`, padding: '7px 12px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <RotateCcw size={13} />New file
                 </button>
@@ -630,7 +643,7 @@ Return only the JSON array.`;
               <button onClick={() => setShowFilters(s => !s)} style={{ background: showFilters ? BRAND.cyanLight : 'transparent', border: 'none', color: BRAND.cyan, fontSize: '11px', fontWeight: 500, cursor: 'pointer', padding: showFilters ? '3px 8px' : 0, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <FilterIcon size={12} />Filter rows {filterRules.length > 0 && `· ${filterRules.length}`}
               </button>
-              <span style={{ marginLeft: 'auto', fontSize: '11px', color: BRAND.grayDark }}>Tip: click column name to rename · hover header for data type</span>
+              <span style={{ marginLeft: 'auto', fontSize: '11px', color: BRAND.grayDark }}>Tip: click name to rename · use arrows to reorder columns</span>
             </div>
 
             {showFilters && (
@@ -681,13 +694,22 @@ Return only the JSON array.`;
                 <thead>
                   <tr>
                     <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '6px 4px', width: '44px', minWidth: '44px', position: 'sticky', left: 0, top: 0, zIndex: 3 }}></th>
-                    {columns.map(col => {
-                      const profile = columnProfiles[col.id];
+                    {pickCols.map((col, i) => {
+                      const isFirst = i === 0;
+                      const isLast = i === pickCols.length - 1;
                       return (
-                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '5px 10px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
-                            <input type="checkbox" checked={col.selected} onChange={() => toggleColumn(col.id)} style={{ accentColor: BRAND.cyan, width: '14px', height: '14px', margin: 0, cursor: 'pointer' }} />
-                            <span style={{ fontSize: '10px', color: col.selected ? BRAND.cyan : BRAND.grayDark, fontWeight: 500 }}>{col.letter}</span>
+                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
+                            <input type="checkbox" checked={col.selected} onChange={() => toggleColumn(col.id)} style={{ accentColor: BRAND.cyan, width: '14px', height: '14px', margin: 0, cursor: 'pointer', flexShrink: 0 }} />
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                              <button onClick={() => moveColumn(col.id, 'left')} disabled={isFirst} style={{ background: 'transparent', border: 'none', color: isFirst ? BRAND.grayMid : BRAND.cyan, padding: '2px', borderRadius: '3px', cursor: isFirst ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center' }} title="Move left">
+                                <ChevronLeft size={12} />
+                              </button>
+                              <span style={{ fontSize: '10px', color: col.selected ? BRAND.cyan : BRAND.grayDark, fontWeight: 500, minWidth: '14px', textAlign: 'center' }}>{col.letter}</span>
+                              <button onClick={() => moveColumn(col.id, 'right')} disabled={isLast} style={{ background: 'transparent', border: 'none', color: isLast ? BRAND.grayMid : BRAND.cyan, padding: '2px', borderRadius: '3px', cursor: isLast ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center' }} title="Move right">
+                                <ChevronRight size={12} />
+                              </button>
+                            </div>
                           </div>
                         </th>
                       );
@@ -695,7 +717,7 @@ Return only the JSON array.`;
                   </tr>
                   <tr>
                     <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '5px 4px', textAlign: 'center', fontSize: '10px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 31, zIndex: 3 }}>name</th>
-                    {columns.map(col => (
+                    {pickCols.map(col => (
                       <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', textAlign: 'left', position: 'sticky', top: 31, zIndex: 2 }}>
                         <input type="text" value={col.displayName} onChange={e => updateColumnName(col.id, e.target.value)} disabled={!col.selected} style={{ width: '100%', border: 'none', background: 'transparent', fontSize: '11px', fontWeight: 500, color: col.selected ? BRAND.black : BRAND.grayMid, padding: '3px 2px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }} title={`Source: ${col.originalName}`} />
                       </th>
@@ -703,7 +725,7 @@ Return only the JSON array.`;
                   </tr>
                   <tr>
                     <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 4px', textAlign: 'center', fontSize: '9px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 62, zIndex: 3 }}>stats</th>
-                    {columns.map(col => {
+                    {pickCols.map(col => {
                       const p = columnProfiles[col.id];
                       if (!p) return <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', position: 'sticky', top: 62, zIndex: 2 }}></th>;
                       const emptyColor = p.emptyPct >= 50 ? BRAND.warning : p.emptyPct >= 20 ? BRAND.grayDark : BRAND.cyan;
@@ -731,7 +753,7 @@ Return only the JSON array.`;
                             <span style={{ fontSize: '10px', color: passesFilter ? BRAND.grayDark : BRAND.warning }}>{i + 2}</span>
                           </div>
                         </td>
-                        {columns.map(col => {
+                        {pickCols.map(col => {
                           const val = row.data[col.originalIndex];
                           const isEmpty = val === '' || val === null || val === undefined;
                           const dimmed = !col.selected || rowDimmed;
@@ -816,26 +838,12 @@ Return only the JSON array.`;
                 <thead>
                   <tr>
                     <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '6px 4px', width: '44px', minWidth: '44px', fontSize: '10px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 0, zIndex: 3 }}>#</th>
-                    {outputCols.map((col, i) => {
-                      const isFirst = i === 0;
-                      const isLast = i === outputCols.length - 1;
-                      return (
-                        <th key={col.id} style={{ background: BRAND.cyan, border: `0.5px solid ${BRAND.cyan}`, padding: '8px 10px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2 }}>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
-                              <button onClick={() => moveColumn(col.id, 'left')} disabled={isFirst} style={{ background: isFirst ? 'transparent' : 'rgba(255,255,255,0.2)', border: 'none', color: isFirst ? 'rgba(255,255,255,0.3)' : 'white', padding: '2px 4px', borderRadius: '3px', cursor: isFirst ? 'not-allowed' : 'pointer', display: 'flex' }} title="Move left">
-                                <ChevronLeft size={12} />
-                              </button>
-                              <span style={{ fontSize: '9px', color: 'rgba(255,255,255,0.75)', fontWeight: 500, letterSpacing: '0.5px' }}>COL {i + 1}</span>
-                              <button onClick={() => moveColumn(col.id, 'right')} disabled={isLast} style={{ background: isLast ? 'transparent' : 'rgba(255,255,255,0.2)', border: 'none', color: isLast ? 'rgba(255,255,255,0.3)' : 'white', padding: '2px 4px', borderRadius: '3px', cursor: isLast ? 'not-allowed' : 'pointer', display: 'flex' }} title="Move right">
-                                <ChevronRight size={12} />
-                              </button>
-                            </div>
-                            <input type="text" value={col.displayName} onChange={e => updateColumnName(col.id, e.target.value)} style={{ width: '100%', border: 'none', background: 'rgba(255,255,255,0.18)', fontSize: '11px', fontWeight: 500, color: 'white', padding: '4px 6px', outline: 'none', fontFamily: 'inherit', borderRadius: '3px', boxSizing: 'border-box' }} title={`Source: ${col.originalName}`} />
-                          </div>
-                        </th>
-                      );
-                    })}
+                    {outputCols.map((col, i) => (
+                      <th key={col.id} style={{ background: BRAND.cyan, border: `0.5px solid ${BRAND.cyan}`, padding: '10px 12px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2, textAlign: 'left' }}>
+                        <div style={{ fontSize: '9px', color: 'rgba(255,255,255,0.7)', fontWeight: 500, letterSpacing: '0.5px', marginBottom: '3px' }}>COL {i + 1}</div>
+                        <div style={{ fontSize: '12px', color: 'white', fontWeight: 500 }} title={`Source: ${col.originalName}`}>{col.displayName}</div>
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
