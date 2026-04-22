@@ -992,15 +992,15 @@ Return only the JSON array.`;
             )}
 
             <div style={{ overflowX: 'auto', maxHeight: '55vh', overflowY: 'auto', background: BRAND.white }}>
-              <table style={{ borderCollapse: 'collapse', fontSize: '11px', fontFamily: 'inherit' }}>
+              <table style={{ borderCollapse: 'separate', borderSpacing: 0, fontSize: '11px', fontFamily: 'inherit' }}>
                 <thead>
-                  <tr>
-                    <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '6px 4px', width: '44px', minWidth: '44px', position: 'sticky', left: 0, top: 0, zIndex: 3 }}></th>
+                  <tr style={{ height: '36px' }}>
+                    <th style={{ background: BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '6px 4px', width: '44px', minWidth: '44px', position: 'sticky', left: 0, top: 0, zIndex: 4, height: '36px', boxSizing: 'border-box' }}></th>
                     {pickCols.map((col, i) => {
                       const isFirst = i === 0;
                       const isLast = i === pickCols.length - 1;
                       return (
-                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2 }}>
+                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2, height: '36px', boxSizing: 'border-box' }}>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
                             <input type="checkbox" checked={col.selected} onChange={() => toggleColumn(col.id)} style={{ accentColor: BRAND.cyan, width: '14px', height: '14px', margin: 0, cursor: 'pointer', flexShrink: 0 }} />
                             <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
@@ -1017,26 +1017,26 @@ Return only the JSON array.`;
                       );
                     })}
                   </tr>
-                  <tr>
-                    <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '5px 4px', textAlign: 'center', fontSize: '10px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 31, zIndex: 3 }}>name</th>
+                  <tr style={{ height: '32px' }}>
+                    <th style={{ background: BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '5px 4px', textAlign: 'center', fontSize: '10px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 36, zIndex: 4, height: '32px', boxSizing: 'border-box' }}>name</th>
                     {pickCols.map(col => (
-                      <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', textAlign: 'left', position: 'sticky', top: 31, zIndex: 2 }}>
+                      <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', textAlign: 'left', position: 'sticky', top: 36, zIndex: 2, height: '32px', boxSizing: 'border-box' }}>
                         <input type="text" value={col.displayName} onChange={e => updateColumnName(col.id, e.target.value)} disabled={!col.selected} style={{ width: '100%', border: 'none', background: 'transparent', fontSize: '11px', fontWeight: 500, color: col.selected ? BRAND.black : BRAND.grayMid, padding: '3px 2px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }} title={`Source: ${col.originalName}`} />
                       </th>
                     ))}
                   </tr>
-                  <tr>
-                    <th style={{ background: BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 4px', textAlign: 'center', fontSize: '9px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 62, zIndex: 3 }}>stats</th>
+                  <tr style={{ height: '28px' }}>
+                    <th style={{ background: BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 4px', textAlign: 'center', fontSize: '9px', color: BRAND.grayDark, fontWeight: 400, position: 'sticky', left: 0, top: 68, zIndex: 4, height: '28px', boxSizing: 'border-box' }}>stats</th>
                     {pickCols.map(col => {
                       const p = columnProfiles[col.id];
-                      if (!p) return <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', position: 'sticky', top: 62, zIndex: 2 }}></th>;
+                      if (!p) return <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', position: 'sticky', top: 68, zIndex: 2, height: '28px', boxSizing: 'border-box' }}></th>;
                       const emptyColor = p.emptyPct >= 50 ? BRAND.warning : p.emptyPct >= 20 ? BRAND.grayDark : BRAND.cyan;
                       return (
-                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 8px', textAlign: 'left', position: 'sticky', top: 62, zIndex: 2, fontWeight: 400 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '9px', color: BRAND.grayDark, flexWrap: 'wrap' }}>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }}><TypeIcon type={p.type} /> {p.type}</span>
-                            <span style={{ color: emptyColor }}>{p.emptyPct}% empty</span>
-                            <span>{p.uniqueCount.toLocaleString()} unique</span>
+                        <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '4px 8px', textAlign: 'left', position: 'sticky', top: 68, zIndex: 2, fontWeight: 400, height: '28px', boxSizing: 'border-box', overflow: 'hidden' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '9px', color: BRAND.grayDark, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '2px', flexShrink: 0 }}><TypeIcon type={p.type} /> {p.type}</span>
+                            <span style={{ color: emptyColor, flexShrink: 0 }}>{p.emptyPct}% empty</span>
+                            <span style={{ flexShrink: 0 }}>{p.uniqueCount.toLocaleString()} unique</span>
                           </div>
                         </th>
                       );
@@ -1049,7 +1049,7 @@ Return only the JSON array.`;
                     const rowDimmed = !row.selected || !passesFilter;
                     return (
                       <tr key={row.index}>
-                        <td style={{ background: rowDimmed ? '#FAFAFA' : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '3px 4px', position: 'sticky', left: 0, zIndex: 1, width: '44px' }}>
+                        <td style={{ background: rowDimmed ? '#FAFAFA' : BRAND.surface, borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '3px 4px', position: 'sticky', left: 0, zIndex: 1, width: '44px' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '4px', justifyContent: 'space-between' }}>
                             <input type="checkbox" checked={row.selected} onChange={() => toggleRow(row.index)} style={{ accentColor: BRAND.cyan, width: '12px', height: '12px', margin: 0, cursor: 'pointer' }} />
                             <span style={{ fontSize: '10px', color: passesFilter ? BRAND.grayDark : BRAND.warning }}>{i + 2}</span>
@@ -1060,7 +1060,7 @@ Return only the JSON array.`;
                           const isEmpty = val === '' || val === null || val === undefined;
                           const dimmed = !col.selected || rowDimmed;
                           return (
-                            <td key={col.id} style={{ border: `0.5px solid ${BRAND.grayLight}`, padding: '6px 10px', color: dimmed ? BRAND.grayMid : (isEmpty ? BRAND.grayMid : BRAND.black), background: dimmed ? '#FAFAFA' : BRAND.white, whiteSpace: 'nowrap', maxWidth: '280px', overflow: 'hidden', textOverflow: 'ellipsis', opacity: dimmed ? 0.55 : 1 }}>
+                            <td key={col.id} style={{ borderRight: `0.5px solid ${BRAND.grayLight}`, borderBottom: `0.5px solid ${BRAND.grayLight}`, padding: '6px 10px', color: dimmed ? BRAND.grayMid : (isEmpty ? BRAND.grayMid : BRAND.black), background: dimmed ? '#FAFAFA' : BRAND.white, whiteSpace: 'nowrap', maxWidth: '280px', overflow: 'hidden', textOverflow: 'ellipsis', opacity: dimmed ? 0.55 : 1 }}>
                               {isEmpty ? '—' : String(val)}
                             </td>
                           );
