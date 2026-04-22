@@ -530,6 +530,11 @@ Return only the JSON array.`;
   const excludedByFilter = rows.length - filteredRowCount;
   const excludedByUntick = selectedRowsRaw.length < rows.length ? (rows.length - selectedRowsRaw.length) : 0;
 
+  // Template matching — which templates fit this file's columns
+  const currentSignature = hasData ? hashColumnSignature(columns.map(c => c.originalName)) : null;
+  const compatibleTemplates = templates.filter(t => t.signature === currentSignature);
+  const incompatibleTemplates = templates.filter(t => t.signature !== currentSignature);
+
   return (
     <div style={{ background: BRAND.surface, padding: '24px', fontFamily: 'inherit' }}>
       <div style={{ maxWidth: '1400px', margin: '0 auto', background: BRAND.white, borderRadius: '12px', border: `0.5px solid ${BRAND.grayLight}`, overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)', position: 'relative' }}>
@@ -612,7 +617,41 @@ Return only the JSON array.`;
                 <p style={{ fontSize: '13px', fontWeight: 500, margin: 0, color: BRAND.black }}>{fileName}</p>
                 <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: '3px 0 0' }}>{columns.length} columns · {rows.length.toLocaleString()} rows · tick what to keep</p>
               </div>
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                {templates.length > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'white', border: `1px solid ${BRAND.grayLight}`, borderRadius: '6px', padding: '0 4px 0 10px', height: '30px' }}>
+                    <Folder size={12} color={BRAND.grayDark} />
+                    <select
+                      value={currentTemplateId || ''}
+                      onChange={e => {
+                        const val = e.target.value;
+                        if (val === '') return;
+                        const t = templates.find(x => x.id === val);
+                        if (t) applyTemplate(t);
+                      }}
+                      style={{ border: 'none', background: 'transparent', fontSize: '12px', color: BRAND.black, fontFamily: 'inherit', cursor: 'pointer', outline: 'none', padding: '4px 6px', maxWidth: '180px' }}
+                      title="Apply a saved template"
+                    >
+                      <option value="">
+                        {currentTemplate ? `Using: ${currentTemplate.name}` : `Apply template… (${templates.length})`}
+                      </option>
+                      {compatibleTemplates.length > 0 && (
+                        <optgroup label="Compatible with this file">
+                          {compatibleTemplates.map(t => (
+                            <option key={t.id} value={t.id}>{t.name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {incompatibleTemplates.length > 0 && (
+                        <optgroup label="Columns don't match (disabled)">
+                          {incompatibleTemplates.map(t => (
+                            <option key={t.id} value={t.id} disabled>{t.name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                    </select>
+                  </div>
+                )}
                 <button onClick={aiSuggestNames} disabled={aiLoading || selectedColCount === 0} style={{ background: 'white', color: BRAND.cyan, border: `1px solid ${BRAND.cyan}`, padding: '7px 12px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (aiLoading || selectedColCount === 0) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (aiLoading || selectedColCount === 0) ? 0.5 : 1 }}>
                   <Sparkles size={13} />{aiLoading ? '...' : 'AI names'}
                 </button>
