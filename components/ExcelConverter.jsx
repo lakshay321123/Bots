@@ -221,6 +221,13 @@ export default function ExcelConverter() {
   const [headerRowIndex, setHeaderRowIndex] = useState(0); // which row is the header (0-based)
   const [fileSizeWarning, setFileSizeWarning] = useState('');
 
+  // Two-file format-matching mode
+  const [mode, setMode] = useState(null);                  // null = unset, 'one-file' or 'two-file'
+  const [targetColumns, setTargetColumns] = useState([]);  // headers from the format file
+  const [targetFileName, setTargetFileName] = useState('');
+  const [columnMapping, setColumnMapping] = useState({});  // { sourceColId: { target, confidence, reason } }
+  const [mappingLoading, setMappingLoading] = useState(false);
+
   const [templates, setTemplates] = useState([]);
   const [currentTemplateId, setCurrentTemplateId] = useState(null);
   const [showTemplateDrawer, setShowTemplateDrawer] = useState(false);
@@ -304,6 +311,7 @@ export default function ExcelConverter() {
     setRows(newRows);
     setColumnProfiles(profiles);
     setOutputOrder(newColumns.map(c => c.id));
+    return { newColumns, newRows };
   }, []);
 
   // Switch active sheet within the loaded workbook
@@ -332,6 +340,132 @@ export default function ExcelConverter() {
     setHeaderRowIndex(newIdx);
     rebuildFromMatrix(rawSheetData, newIdx);
   }, [rawSheetData, rebuildFromMatrix]);
+
+  // Apply an AI mapping result: select matched source cols, rename to target names,
+  // order them to match the target file's column order, drop everything else.
+  const applyMapping = useCallback((mappings, currentColumns) => {
+    if (!Array.isArray(mappings) || mappings.length === 0) return;
+
+    // Build a quick map: sourceColumnName → mapping entry
+    const bySource = {};
+    mappings.forEach(m => {
+      if (m.source) bySource[String(m.source).trim().toLowerCase()] = m;
+    });
+
+    // Update each column: if its source name matches a mapping, select+rename it
+    const updated = currentColumns.map(c => {
+      const m = bySource[String(c.originalName).trim().toLowerCase()];
+      if (m) {
+        return { ...c, selected: true, displayName: m.target };
+      }
+      return { ...c, selected: false };
+    });
+
+    // Build new outputOrder: target order first (only mapped ones), then unmapped at end
+    const targetToSourceColId = {};
+    mappings.forEach(m => {
+      if (!m.source) return;
+      const col = updated.find(c => c.originalName.toLowerCase() === String(m.source).trim().toLowerCase());
+      if (col) targetToSourceColId[m.target] = col.id;
+    });
+    const orderedIds = mappings
+      .map(m => targetToSourceColId[m.target])
+      .filter(Boolean);
+    const remainingIds = updated
+      .filter(c => !orderedIds.includes(c.id))
+      .map(c => c.id);
+
+    // Build a per-column mapping lookup for confidence pills
+    const mapLookup = {};
+    updated.forEach(c => {
+      const m = bySource[String(c.originalName).trim().toLowerCase()];
+      if (m) mapLookup[c.id] = m;
+    });
+
+    setColumns(updated);
+    setOutputOrder([...orderedIds, ...remainingIds]);
+    setColumnMapping(mapLookup);
+  }, []);
+
+  // Run the AI mapping: source columns × target columns → mapping
+  const runColumnMatch = useCallback(async (sourceColumns, sourceRows, targets) => {
+    setMappingLoading(true);
+    setError('');
+    try {
+      const sampleRows = sourceRows.slice(0, 5).map(r => r.data);
+      const sourceNames = sourceColumns.map(c => c.originalName);
+      const res = await fetch('/api/match-columns', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceColumns: sourceNames, targetColumns: targets, sampleRows }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(errBody.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (!data.mappings || !Array.isArray(data.mappings)) {
+        throw new Error('No mappings returned');
+      }
+      applyMapping(data.mappings, sourceColumns);
+      const matched = data.mappings.filter(m => m.source).length;
+      const lowConf = data.mappings.filter(m => m.source && (m.confidence || 0) < 0.7).length;
+      setSuccessMessage(
+        `Matched ${matched} of ${targets.length} target columns` +
+        (lowConf > 0 ? ` · ${lowConf} need review` : '')
+      );
+      setTimeout(() => setSuccessMessage(''), 5000);
+    } catch (err) {
+      setError(`Auto-match failed: ${err.message}. You can still pick columns manually.`);
+    } finally {
+      setMappingLoading(false);
+    }
+  }, [applyMapping]);
+
+  // Upload the format file (just headers), then if source is already loaded, run the match
+  const handleFormatFileUpload = useCallback(async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setError('');
+    setTargetFileName(file.name);
+
+    try {
+      const isCSV = /\.csv$/i.test(file.name);
+      let wb;
+      if (isCSV) {
+        const text = await readFileAsText(file);
+        wb = XLSX.read(text, { type: 'string', cellDates: true, raw: false });
+      } else {
+        const buf = await file.arrayBuffer();
+        wb = XLSX.read(buf, { type: 'array', cellDates: true, cellNF: false, cellText: false });
+      }
+      const firstSheetName = wb.SheetNames[0];
+      const sheet = wb.Sheets[firstSheetName];
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false, blankrows: false });
+      if (!matrix.length) {
+        setError('Format file is empty.');
+        return;
+      }
+      // Detect header row (same logic as input file) — usually row 0 for templates
+      const detected = detectHeaderRow(matrix);
+      const headerRow = matrix[detected] || [];
+      const targets = headerRow
+        .map(h => String(h || '').trim())
+        .filter(h => h !== '');
+      if (targets.length === 0) {
+        setError('Could not find any column headers in the format file.');
+        return;
+      }
+      setTargetColumns(targets);
+
+      // If source already loaded, run the match
+      if (columns.length > 0) {
+        await runColumnMatch(columns, rows, targets);
+      }
+    } catch (err) {
+      setError(`Could not read format file: ${err.message || 'invalid Excel/CSV'}`);
+    }
+  }, [columns, rows, runColumnMatch]);
 
   const handleFileUpload = useCallback(async (e) => {
     const file = e.target.files && e.target.files[0];
@@ -427,7 +561,7 @@ export default function ExcelConverter() {
       setActiveSheet(firstNonEmpty);
       setRawSheetData(matrix);
       setHeaderRowIndex(detected);
-      rebuildFromMatrix(matrix, detected);
+      const built = rebuildFromMatrix(matrix, detected);
 
       // Match against saved templates using the detected header
       const headerRow = matrix[detected] || [];
@@ -437,11 +571,16 @@ export default function ExcelConverter() {
       const match = currentTemplates.find(t => t.signature === signature);
       if (match) setMatchedTemplate(match);
 
+      // Two-file mode: if a format file is already loaded, run the AI match now
+      if (mode === 'two-file' && targetColumns.length > 0 && built) {
+        await runColumnMatch(built.newColumns, built.newRows, targetColumns);
+      }
+
     } catch (err) {
       setError(`Could not read that file: ${err.message || 'invalid Excel/CSV'}`);
       console.error(err);
     }
-  }, [loadTemplates, rebuildFromMatrix]);
+  }, [loadTemplates, rebuildFromMatrix, mode, targetColumns, runColumnMatch]);
 
   const toggleColumn = (id) => setColumns(cols => cols.map(c => c.id === id ? { ...c, selected: !c.selected } : c));
   const toggleRow = (index) => setRows(rs => rs.map(r => r.index === index ? { ...r, selected: !r.selected } : r));
@@ -700,6 +839,8 @@ Return only the JSON array.`;
     setCurrentTemplateId(null); setMatchedTemplate(null); setShowFilters(false);
     setWorkbook(null); setSheetNames([]); setActiveSheet('');
     setRawSheetData([]); setHeaderRowIndex(0); setFileSizeWarning('');
+    setMode(null); setTargetColumns([]); setTargetFileName('');
+    setColumnMapping({}); setMappingLoading(false);
   };
 
   const selectedColCount = columns.filter(c => c.selected).length;
@@ -751,19 +892,157 @@ Return only the JSON array.`;
         </div>
 
         {!hasData && (
-          <div style={{ padding: '48px 24px' }}>
-            <label
-              style={{ display: 'block', maxWidth: '520px', margin: '0 auto', padding: '44px 24px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s' }}
-              onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
-              onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
-            >
-              <Upload size={36} color={BRAND.cyan} strokeWidth={1.5} style={{ marginBottom: '14px' }} />
-              <p style={{ fontSize: '16px', fontWeight: 500, color: BRAND.black, margin: '0 0 6px' }}>Drop your Excel file here</p>
-              <p style={{ fontSize: '13px', color: BRAND.grayDark, margin: 0 }}>or click to browse · .xlsx, .xls, .csv</p>
-              <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} style={{ display: 'none' }} />
-            </label>
-            {templates.length > 0 && (
-              <div style={{ maxWidth: '520px', margin: '24px auto 0' }}>
+          <div style={{ padding: '40px 24px 48px' }}>
+
+            {/* Mode picker — shown until user chooses */}
+            {mode === null && (
+              <div style={{ maxWidth: '780px', margin: '0 auto' }}>
+                <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 16px', letterSpacing: '0.5px', textTransform: 'uppercase', textAlign: 'center', fontWeight: 500 }}>How do you want to start?</p>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+                  <button
+                    onClick={() => setMode('one-file')}
+                    style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit' }}
+                    onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                      <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <FileSpreadsheet size={18} color={BRAND.cyan} />
+                      </div>
+                      <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>One file · Manual</p>
+                    </div>
+                    <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
+                      Upload your messy file. Pick the columns you want, rename them, filter rows, save as a template for next time.
+                    </p>
+                    <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you're building a new template →</p>
+                  </button>
+
+                  <button
+                    onClick={() => setMode('two-file')}
+                    style={{ background: BRAND.white, border: `1.5px solid ${BRAND.grayLight}`, borderRadius: '12px', padding: '24px 20px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s', fontFamily: 'inherit', position: 'relative' }}
+                    onMouseEnter={(e) => { e.currentTarget.style.borderColor = BRAND.cyan; e.currentTarget.style.background = BRAND.cyanLight + '40'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.borderColor = BRAND.grayLight; e.currentTarget.style.background = BRAND.white; }}
+                  >
+                    <span style={{ position: 'absolute', top: '12px', right: '12px', fontSize: '9px', fontWeight: 600, color: 'white', background: BRAND.cyan, padding: '2px 8px', borderRadius: '10px', letterSpacing: '0.5px' }}>NEW · AI</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                      <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: BRAND.cyanLight, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <Sparkles size={18} color={BRAND.cyan} />
+                      </div>
+                      <p style={{ fontSize: '14px', fontWeight: 600, margin: 0, color: BRAND.black }}>Two files · Auto-match</p>
+                    </div>
+                    <p style={{ fontSize: '12px', color: BRAND.grayDark, margin: 0, lineHeight: 1.5 }}>
+                      Drop your messy file <em>plus</em> a target format file (just headers needed). AI maps the columns automatically.
+                    </p>
+                    <p style={{ fontSize: '11px', color: BRAND.cyan, fontWeight: 500, marginTop: '12px', marginBottom: 0 }}>Best when you have a target format →</p>
+                  </button>
+                </div>
+
+                {templates.length > 0 && (
+                  <p style={{ fontSize: '12px', color: BRAND.grayDark, textAlign: 'center', marginTop: '20px' }}>
+                    Or pick a saved template after uploading.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* One-file mode dropzone */}
+            {mode === 'one-file' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
+                  <button onClick={() => setMode(null)} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', padding: '4px 8px' }}>
+                    <ArrowLeft size={12} /> Back to mode picker
+                  </button>
+                </div>
+                <label
+                  style={{ display: 'block', maxWidth: '520px', margin: '0 auto', padding: '44px 24px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
+                  onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
+                >
+                  <Upload size={36} color={BRAND.cyan} strokeWidth={1.5} style={{ marginBottom: '14px' }} />
+                  <p style={{ fontSize: '16px', fontWeight: 500, color: BRAND.black, margin: '0 0 6px' }}>Drop your Excel file here</p>
+                  <p style={{ fontSize: '13px', color: BRAND.grayDark, margin: 0 }}>or click to browse · .xlsx, .xls, .csv</p>
+                  <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} style={{ display: 'none' }} />
+                </label>
+              </>
+            )}
+
+            {/* Two-file mode: format dropzone first, then input dropzone */}
+            {mode === 'two-file' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
+                  <button onClick={() => { setMode(null); setTargetColumns([]); setTargetFileName(''); }} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', padding: '4px 8px' }}>
+                    <ArrowLeft size={12} /> Back to mode picker
+                  </button>
+                </div>
+
+                <div style={{ maxWidth: '900px', margin: '0 auto', display: 'grid', gridTemplateColumns: '1fr 40px 1fr', gap: '16px', alignItems: 'stretch' }}>
+
+                  {/* Step 1: Format/target file */}
+                  <div>
+                    <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', letterSpacing: '0.5px', textTransform: 'uppercase', fontWeight: 500 }}>Step 1 · Target format</p>
+                    {targetColumns.length === 0 ? (
+                      <label
+                        style={{ display: 'block', padding: '32px 20px', border: `2px dashed ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '50', textAlign: 'center', cursor: 'pointer', transition: 'background 0.15s', minHeight: '200px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+                        onMouseEnter={(e) => e.currentTarget.style.background = BRAND.cyanLight + '80'}
+                        onMouseLeave={(e) => e.currentTarget.style.background = BRAND.cyanLight + '50'}
+                      >
+                        <Upload size={28} color={BRAND.cyan} strokeWidth={1.5} style={{ marginBottom: '10px' }} />
+                        <p style={{ fontSize: '14px', fontWeight: 500, color: BRAND.black, margin: '0 0 4px' }}>The format you need</p>
+                        <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: 0 }}>An Excel/CSV with the headers you want</p>
+                        <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '4px 0 0' }}>Data rows are ignored</p>
+                        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFormatFileUpload} style={{ display: 'none' }} />
+                      </label>
+                    ) : (
+                      <div style={{ padding: '20px', border: `1.5px solid ${BRAND.cyan}`, borderRadius: '12px', background: BRAND.cyanLight + '40', minHeight: '200px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                          <Check size={14} color={BRAND.cyan} />
+                          <p style={{ fontSize: '12px', fontWeight: 500, margin: 0, color: BRAND.black, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{targetFileName}</p>
+                          <button onClick={() => { setTargetColumns([]); setTargetFileName(''); }} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, cursor: 'pointer', padding: '2px' }} title="Remove">
+                            <X size={12} />
+                          </button>
+                        </div>
+                        <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', textTransform: 'uppercase', letterSpacing: '0.4px' }}>{targetColumns.length} target columns</p>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '110px', overflowY: 'auto' }}>
+                          {targetColumns.map((col, i) => (
+                            <span key={i} style={{ fontSize: '10px', background: BRAND.white, color: BRAND.cyan, padding: '3px 8px', borderRadius: '10px', border: `0.5px solid ${BRAND.cyanSoft}`, whiteSpace: 'nowrap' }}>{col}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Arrow between */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: targetColumns.length > 0 ? BRAND.cyan : BRAND.grayLight, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.2s' }}>
+                      <ArrowRight size={16} />
+                    </div>
+                  </div>
+
+                  {/* Step 2: Input file */}
+                  <div>
+                    <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 8px', letterSpacing: '0.5px', textTransform: 'uppercase', fontWeight: 500 }}>Step 2 · Your messy file</p>
+                    <label
+                      style={{ display: 'block', padding: '32px 20px', border: `2px dashed ${targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid}`, borderRadius: '12px', background: targetColumns.length > 0 ? BRAND.cyanLight + '50' : BRAND.surface, textAlign: 'center', cursor: targetColumns.length > 0 ? 'pointer' : 'not-allowed', opacity: targetColumns.length > 0 ? 1 : 0.5, minHeight: '200px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+                    >
+                      <Upload size={28} color={targetColumns.length > 0 ? BRAND.cyan : BRAND.grayMid} strokeWidth={1.5} style={{ marginBottom: '10px' }} />
+                      <p style={{ fontSize: '14px', fontWeight: 500, color: BRAND.black, margin: '0 0 4px' }}>Your data file</p>
+                      <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: 0 }}>The messy export to be cleaned</p>
+                      <p style={{ fontSize: '10px', color: BRAND.grayDark, margin: '4px 0 0' }}>{targetColumns.length > 0 ? 'AI will auto-match columns' : 'Upload format file first ↑'}</p>
+                      <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFileUpload} disabled={targetColumns.length === 0} style={{ display: 'none' }} />
+                    </label>
+                  </div>
+                </div>
+
+                {mappingLoading && (
+                  <p style={{ textAlign: 'center', color: BRAND.cyan, fontSize: '12px', marginTop: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                    <Sparkles size={14} /> Claude is matching your columns…
+                  </p>
+                )}
+              </>
+            )}
+
+            {templates.length > 0 && mode !== null && (
+              <div style={{ maxWidth: '520px', margin: '32px auto 0' }}>
                 <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '0 0 10px', letterSpacing: '0.5px', textTransform: 'uppercase' }}>Your saved templates</p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                   {templates.slice(0, 5).map(t => (
@@ -845,6 +1124,34 @@ Return only the JSON array.`;
                     <span style={{ color: BRAND.grayDark, fontSize: '11px' }}>auto-detected · adjust if title bars are above the headers</span>
                   </div>
                 )}
+              </div>
+            )}
+
+            {mode === 'two-file' && targetColumns.length > 0 && (
+              <div style={{ padding: '10px 20px', background: BRAND.cyanLight, borderBottom: `0.5px solid ${BRAND.cyanSoft}`, display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                <Sparkles size={14} color={BRAND.cyan} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ fontSize: '12px', fontWeight: 500, color: BRAND.black, margin: 0 }}>
+                    {mappingLoading
+                      ? 'Claude is matching columns…'
+                      : `Auto-matched against ${targetFileName} · ${Object.keys(columnMapping).length} of ${targetColumns.length} columns mapped`}
+                  </p>
+                  <p style={{ fontSize: '11px', color: BRAND.grayDark, margin: '2px 0 0' }}>
+                    <span style={{ color: '#16A34A' }}>● high</span>
+                    {' · '}
+                    <span style={{ color: '#C57300' }}>● medium</span>
+                    {' · '}
+                    <span style={{ color: BRAND.danger }}>● low confidence</span>
+                    {' · review the dots above each column letter'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => runColumnMatch(columns, rows, targetColumns)}
+                  disabled={mappingLoading}
+                  style={{ background: 'white', color: BRAND.cyan, border: `1px solid ${BRAND.cyan}`, padding: '5px 12px', borderRadius: '4px', fontSize: '11px', fontWeight: 500, cursor: mappingLoading ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px', opacity: mappingLoading ? 0.5 : 1 }}
+                >
+                  <Sparkles size={11} /> Re-match
+                </button>
               </div>
             )}
 
@@ -999,11 +1306,22 @@ Return only the JSON array.`;
                     {pickCols.map((col, i) => {
                       const isFirst = i === 0;
                       const isLast = i === pickCols.length - 1;
+                      const mapEntry = columnMapping[col.id];
+                      const confColor = !mapEntry ? null
+                        : mapEntry.confidence >= 0.85 ? '#16A34A'   // green
+                        : mapEntry.confidence >= 0.6 ? '#C57300'   // amber
+                        : BRAND.danger;                            // red
                       return (
                         <th key={col.id} style={{ background: col.selected ? BRAND.cyanLight : BRAND.surface, border: `0.5px solid ${BRAND.grayLight}`, padding: '4px 6px', minWidth: '160px', position: 'sticky', top: 0, zIndex: 2 }}>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
                             <input type="checkbox" checked={col.selected} onChange={() => toggleColumn(col.id)} style={{ accentColor: BRAND.cyan, width: '14px', height: '14px', margin: 0, cursor: 'pointer', flexShrink: 0 }} />
                             <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                              {confColor && (
+                                <span
+                                  title={`Mapped to "${mapEntry.target}" · ${Math.round((mapEntry.confidence || 0) * 100)}% confidence · ${mapEntry.reason || ''}`}
+                                  style={{ width: '8px', height: '8px', borderRadius: '50%', background: confColor, flexShrink: 0, marginRight: '2px' }}
+                                />
+                              )}
                               <button onClick={() => moveColumn(col.id, 'left')} disabled={isFirst} style={{ background: 'transparent', border: 'none', color: isFirst ? BRAND.grayMid : BRAND.cyan, padding: '2px', borderRadius: '3px', cursor: isFirst ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center' }} title="Move left">
                                 <ChevronLeft size={12} />
                               </button>
