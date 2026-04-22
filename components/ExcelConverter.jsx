@@ -619,11 +619,38 @@ Return only the JSON array.`;
                 <button onClick={reset} style={{ background: 'white', color: BRAND.grayDark, border: `1px solid ${BRAND.grayLight}`, padding: '7px 12px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <RotateCcw size={13} />New file
                 </button>
-                <button onClick={goToPreview} disabled={selectedColCount === 0 || effectivelySelectedRows.length === 0} style={{ background: BRAND.cyan, color: 'white', border: 'none', padding: '7px 14px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 0.5 : 1 }}>
+                <button
+                  onClick={goToPreview}
+                  disabled={selectedColCount === 0 || effectivelySelectedRows.length === 0}
+                  title={
+                    selectedColCount === 0
+                      ? 'Tick at least one column to continue'
+                      : effectivelySelectedRows.length === 0
+                        ? 'No rows match — adjust or clear your filter rules'
+                        : ''
+                  }
+                  style={{ background: BRAND.cyan, color: 'white', border: 'none', padding: '7px 14px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 0.5 : 1 }}
+                >
                   Next · preview<ArrowRight size={13} />
                 </button>
               </div>
             </div>
+
+            {(selectedColCount === 0 || effectivelySelectedRows.length === 0) && hasData && (
+              <div style={{ padding: '10px 20px', background: '#FFF5E5', borderBottom: `0.5px solid ${BRAND.grayLight}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: BRAND.warning, fontSize: '12px', fontWeight: 500 }}>
+                  <AlertTriangle size={14} />
+                  {selectedColCount === 0 && 'No columns selected — tick at least one column to continue.'}
+                  {selectedColCount > 0 && effectivelySelectedRows.length === 0 && filterRules.length > 0 && `0 rows match your ${filterRules.length} filter rule${filterRules.length !== 1 ? 's' : ''}. Adjust or clear the filter to proceed.`}
+                  {selectedColCount > 0 && effectivelySelectedRows.length === 0 && filterRules.length === 0 && 'No rows selected — tick at least one row to continue.'}
+                </div>
+                {filterRules.length > 0 && effectivelySelectedRows.length === 0 && (
+                  <button onClick={clearFilters} style={{ background: 'white', color: BRAND.warning, border: `1px solid ${BRAND.warning}`, padding: '5px 12px', borderRadius: '4px', fontSize: '11px', fontWeight: 500, cursor: 'pointer' }}>
+                    Clear filters
+                  </button>
+                )}
+              </div>
+            )}
 
             {(successMessage || error) && (
               <div style={{ padding: '8px 20px', background: error ? '#FDEBEB' : BRAND.cyanLight, color: error ? BRAND.danger : BRAND.cyan, fontSize: '12px', fontWeight: 500, borderBottom: `0.5px solid ${BRAND.grayLight}` }}>
@@ -655,7 +682,7 @@ Return only the JSON array.`;
                       <button onClick={clearFilters} style={{ background: 'transparent', border: 'none', color: BRAND.grayDark, fontSize: '11px', cursor: 'pointer', padding: 0 }}>Clear all</button>
                     )}
                     <span style={{ fontSize: '12px', color: BRAND.grayDark }}>
-                      <span style={{ color: BRAND.cyan, fontWeight: 500 }}>{filteredRowCount.toLocaleString()}</span> of {rows.length.toLocaleString()} rows match
+                      <span style={{ color: filteredRowCount === 0 ? BRAND.warning : BRAND.cyan, fontWeight: 500 }}>{filteredRowCount.toLocaleString()}</span> of {rows.length.toLocaleString()} rows match
                     </span>
                   </div>
                 </div>
