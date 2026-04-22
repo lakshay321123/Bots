@@ -202,7 +202,17 @@ async function readFileAsText(file) {
 
 // Resize handle — drag to adjust the table height.
 // Calls onResize(absoluteHeight) where absoluteHeight = startHeight + deltaY
-function ResizeHandle({ getStartHeight, onResize }) {
+// Height bounds for the resizable table — also used as ARIA min/max
+// on the resize separator so screen readers announce the range.
+const TABLE_HEIGHT_MIN = 240;
+const TABLE_HEIGHT_MAX = 1400;
+
+function ResizeHandle({ currentHeight, getStartHeight, onResize, min = TABLE_HEIGHT_MIN, max = TABLE_HEIGHT_MAX }) {
+  // Visible focus ring is a separate state instead of relying on :focus-visible
+  // CSS — this component uses inline styles, so toggling React state is the
+  // cleanest way to give keyboard users a visible focus indicator without
+  // adding a global stylesheet.
+  const [hasFocus, setHasFocus] = useState(false);
   // Keep a reference to the active drag's cleanup function so we can
   // invoke it if the component unmounts mid-drag (prevents document.body
   // from getting stuck with ns-resize cursor and no text selection).
@@ -236,7 +246,7 @@ function ResizeHandle({ getStartHeight, onResize }) {
   };
 
   const handleKeyDown = (e) => {
-    // Keyboard accessibility — Arrow keys nudge, Page/Home/End jump
+    // Keyboard accessibility — Arrow keys nudge, Page keys jump, Home/End extremes
     const step = e.shiftKey ? 48 : 24;
     if (e.key === 'ArrowUp') {
       e.preventDefault();
@@ -250,6 +260,12 @@ function ResizeHandle({ getStartHeight, onResize }) {
     } else if (e.key === 'PageDown') {
       e.preventDefault();
       onResize(getStartHeight() + 120);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      onResize(min);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      onResize(max);
     }
   };
 
@@ -258,24 +274,32 @@ function ResizeHandle({ getStartHeight, onResize }) {
       role="separator"
       aria-label="Resize table height"
       aria-orientation="horizontal"
+      aria-valuenow={currentHeight}
+      aria-valuemin={min}
+      aria-valuemax={max}
       tabIndex={0}
       onPointerDown={startDrag}
       onKeyDown={handleKeyDown}
-      title="Drag to resize the table (or use arrow keys)"
+      onFocus={() => setHasFocus(true)}
+      onBlur={() => setHasFocus(false)}
+      title="Drag to resize the table (or use arrow keys, Home/End for min/max)"
       style={{
         height: '8px',
         cursor: 'ns-resize',
-        background: '#F5F7F8',
+        // Keyboard focus indicator: a 2px cyan inset shadow so the user can
+        // see which element has focus. Inline so we don't need a stylesheet.
+        background: hasFocus ? '#D6EBF2' : '#F5F7F8',
         borderTop: '0.5px solid #E6E6E6',
         borderBottom: '0.5px solid #E6E6E6',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         touchAction: 'none',
-        outline: 'none',
+        outline: hasFocus ? '2px solid #00B5D6' : 'none',
+        outlineOffset: '-2px',
       }}
     >
-      <div style={{ width: '40px', height: '3px', background: '#CCCCCC', borderRadius: '2px' }} />
+      <div style={{ width: '40px', height: '3px', background: hasFocus ? '#00B5D6' : '#CCCCCC', borderRadius: '2px' }} />
     </div>
   );
 }
@@ -431,8 +455,8 @@ export default function ExcelConverter() {
 
   // Resize handle: clamp between 240 and 1400 px so it always stays usable
   const handleTableResize = useCallback((newHeight) => {
-    if (newHeight < 240) newHeight = 240;
-    if (newHeight > 1400) newHeight = 1400;
+    if (newHeight < TABLE_HEIGHT_MIN) newHeight = TABLE_HEIGHT_MIN;
+    if (newHeight > TABLE_HEIGHT_MAX) newHeight = TABLE_HEIGHT_MAX;
     setTableHeight(newHeight);
   }, []);
 
@@ -1274,7 +1298,7 @@ Return only the JSON array.`;
               </table>
             </div>
 
-            <ResizeHandle getStartHeight={() => tableHeight} onResize={handleTableResize} />
+            <ResizeHandle currentHeight={tableHeight} getStartHeight={() => tableHeight} onResize={handleTableResize} />
 
             {rows.length > 100 && (
               <div style={{ padding: '8px 20px', background: BRAND.cyanLight + '80', borderTop: `0.5px solid ${BRAND.grayLight}`, fontSize: '11px', color: BRAND.grayDark, textAlign: 'center' }}>
@@ -1371,7 +1395,7 @@ Return only the JSON array.`;
               </table>
             </div>
 
-            <ResizeHandle getStartHeight={() => tableHeight} onResize={handleTableResize} />
+            <ResizeHandle currentHeight={tableHeight} getStartHeight={() => tableHeight} onResize={handleTableResize} />
 
             {effectivelySelectedRows.length > 100 && (
               <div style={{ padding: '8px 20px', background: BRAND.cyanLight + '80', borderTop: `0.5px solid ${BRAND.grayLight}`, fontSize: '11px', color: BRAND.grayDark, textAlign: 'center' }}>
