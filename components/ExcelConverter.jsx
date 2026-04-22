@@ -368,12 +368,16 @@ export default function ExcelConverter() {
 
   // Apply an AI mapping result: select matched source cols, rename to target names,
   // order them to match the target file's column order, drop everything else.
-  const applyMapping = useCallback((mappings, currentColumns) => {
+  //
+  // We use the functional setColumns(prev => ...) updater so the mapping is
+  // applied against whatever the user has in front of them right now — not
+  // a snapshot taken when the API call started 5+ seconds ago. This matters
+  // because the user may have toggled column selection or renamed something
+  // while the AI request was in flight.
+  const applyMapping = useCallback((mappings) => {
     if (!Array.isArray(mappings) || mappings.length === 0) return;
 
-    // Build a quick map from BOTH originalName and displayName to mapping entry.
-    // This way Claude can return either the source name OR the current display
-    // name and we still find the right column.
+    // Pre-build the lookup map once outside the state updater (pure data).
     const bySource = {};
     mappings.forEach(m => {
       if (m.source) {
@@ -387,26 +391,38 @@ export default function ExcelConverter() {
       return byDisplay || null;
     };
 
-    // Update each column. If matched: select + rename to target name.
-    // If NOT matched: untick AND reset displayName back to originalName so a
-    // stale rename from a previous match doesn't linger.
-    const updated = currentColumns.map(c => {
-      const m = findMapping(c);
-      if (m) {
-        return { ...c, selected: true, displayName: m.target };
-      }
-      return { ...c, selected: false, displayName: c.originalName };
+    // We need to share the `updated` array between three setters
+    // (columns, outputOrder, columnMapping). Compute it once inside the
+    // setColumns updater, capture it in this closure, then use it for the
+    // other two setters which run synchronously right after.
+    let updatedSnapshot = null;
+
+    setColumns(prev => {
+      const updated = prev.map(c => {
+        const m = findMapping(c);
+        if (m) {
+          return { ...c, selected: true, displayName: m.target };
+        }
+        // If a column isn't in this mapping, untick AND restore its original
+        // name so any stale rename from a previous match doesn't linger.
+        return { ...c, selected: false, displayName: c.originalName };
+      });
+      updatedSnapshot = updated;
+      return updated;
     });
 
-    // Build new outputOrder: target order first (only mapped ones), then unmapped at end.
-    // Normalize trim on BOTH sides consistently, and dedupe so one source col
-    // can't end up in outputOrder twice if Claude maps it to multiple targets.
+    // Defensive guard: if for some reason setColumns didn't run synchronously
+    // (it should, but React internals could change), bail out before using
+    // a null snapshot.
+    if (!updatedSnapshot) return;
+
+    // Build new outputOrder: target order first (only mapped, deduped), then unmapped at end.
     const targetToSourceColId = {};
     mappings.forEach(m => {
       if (!m.source) return;
       const normalizedSource = String(m.source).trim().toLowerCase();
       const normalizedTarget = String(m.target).trim().toLowerCase();
-      const col = updated.find(c =>
+      const col = updatedSnapshot.find(c =>
         String(c.originalName).trim().toLowerCase() === normalizedSource ||
         String(c.displayName).trim().toLowerCase() === normalizedSource ||
         String(c.displayName).trim().toLowerCase() === normalizedTarget
@@ -421,18 +437,17 @@ export default function ExcelConverter() {
         seen.add(id);
         return true;
       });
-    const remainingIds = updated
+    const remainingIds = updatedSnapshot
       .filter(c => !seen.has(c.id))
       .map(c => c.id);
 
     // Build a per-column mapping lookup for confidence pills
     const mapLookup = {};
-    updated.forEach(c => {
+    updatedSnapshot.forEach(c => {
       const m = findMapping(c);
       if (m) mapLookup[c.id] = m;
     });
 
-    setColumns(updated);
     setOutputOrder([...orderedIds, ...remainingIds]);
     setColumnMapping(mapLookup);
   }, []);
@@ -462,7 +477,7 @@ export default function ExcelConverter() {
       if (!data.mappings || !Array.isArray(data.mappings)) {
         throw new Error('No mappings returned');
       }
-      applyMapping(data.mappings, sourceColumns);
+      applyMapping(data.mappings);
       const matched = data.mappings.filter(m => m.source).length;
       const lowConf = data.mappings.filter(m => m.source && (m.confidence || 0) < 0.7).length;
       setSuccessMessage(

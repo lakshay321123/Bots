@@ -91,10 +91,15 @@ Each "source" value must EXACTLY match one of the SOURCE column names above (or 
     }
 
     if (!upstream.ok) {
-      // Log upstream body server-side for debugging, but never echo it back to the client —
-      // Claude may have mirrored prompt content (which contains PHI sample values).
-      const errText = await upstream.text().catch(() => '');
-      console.error('[match-columns] upstream error', upstream.status, errText.slice(0, 500));
+      // Don't log the upstream body — Claude may have echoed back prompt
+      // content (which contains PHI sample values). Log only the status
+      // and the upstream request id, which are useful for debugging
+      // and contain no patient data.
+      const upstreamReqId =
+        upstream.headers.get('request-id') ||
+        upstream.headers.get('x-request-id') ||
+        '(none)';
+      console.error('[match-columns] upstream error status=%d request-id=%s', upstream.status, upstreamReqId);
       return Response.json({ error: `Claude API returned ${upstream.status}` }, { status: 502 });
     }
 
@@ -114,8 +119,9 @@ Each "source" value must EXACTLY match one of the SOURCE column names above (or 
     try {
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      // Don't echo `cleaned` back — it can contain PHI from the prompt samples.
-      console.error('[match-columns] Claude returned invalid JSON. First 300 chars:', cleaned.slice(0, 300));
+      // Don't log `cleaned` either — it can contain PHI from echoed samples.
+      // We only need to know the failure happened; the prompt is reproducible.
+      console.error('[match-columns] Claude returned invalid JSON (length=%d)', cleaned.length);
       return Response.json({ error: 'Claude returned invalid JSON' }, { status: 502 });
     }
 
@@ -125,15 +131,48 @@ Each "source" value must EXACTLY match one of the SOURCE column names above (or 
 
     // Validate each mapping has the expected shape before returning.
     // The client's applyMapping assumes target/source/confidence/reason.
-    const validMappings = parsed.mappings.every(m =>
+    const validShape = parsed.mappings.every(m =>
       m && typeof m === 'object' &&
       typeof m.target === 'string' && m.target.length > 0 &&
       (m.source === null || typeof m.source === 'string') &&
       (typeof m.confidence === 'number' || m.confidence === undefined)
     );
-    if (!validMappings) {
-      console.error('[match-columns] malformed mapping items', JSON.stringify(parsed.mappings).slice(0, 300));
+    if (!validShape) {
+      // Don't log the items themselves — they may contain echoed PHI sample values.
+      console.error('[match-columns] malformed mapping items (count=%d)', parsed.mappings.length);
       return Response.json({ error: 'Claude returned malformed mapping items' }, { status: 502 });
+    }
+
+    // Stricter contract validation: targets must exactly match the submitted
+    // set (no hallucinated targets, no missing ones), sources (if non-null)
+    // must exist in the submitted sourceColumns, and no source can be claimed
+    // by two different targets — otherwise the client would render duplicate
+    // columns or silently drop expected ones.
+    const submittedTargets = new Set(targetColumns.map(t => String(t)));
+    const submittedSources = new Set(sourceColumns.map(s => String(s)));
+    const seenSource = new Set();
+    let contractError = null;
+    for (const m of parsed.mappings) {
+      if (!submittedTargets.has(m.target)) {
+        contractError = 'unknown_target';
+        break;
+      }
+      if (m.source !== null && m.source !== undefined && m.source !== '') {
+        if (!submittedSources.has(m.source)) {
+          contractError = 'unknown_source';
+          break;
+        }
+        if (seenSource.has(m.source)) {
+          contractError = 'duplicate_source';
+          break;
+        }
+        seenSource.add(m.source);
+      }
+    }
+    if (contractError) {
+      console.error('[match-columns] mapping contract violation: %s (target_count=%d, source_count=%d)',
+        contractError, targetColumns.length, sourceColumns.length);
+      return Response.json({ error: 'Claude returned an invalid mapping; please retry' }, { status: 502 });
     }
 
     // Normalize: ensure confidence is a number in [0,1] and reason is a string
