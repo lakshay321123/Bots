@@ -788,13 +788,24 @@ export default function ExcelConverter() {
       setHeaderRowIndex(detected);
       const built = rebuildFromMatrix(matrix, detected);
 
-      // Match against saved templates using the detected header
-      const headerRow = matrix[detected] || [];
-      const colNames = headerRow.map(h => String(h || '').trim());
-      const signature = hashColumnSignature(colNames);
-      const currentTemplates = await loadTemplates();
-      const match = currentTemplates.find(t => t.signature === signature);
-      if (match) setMatchedTemplate(match);
+      // Match against saved templates using the detected header.
+      //
+      // IMPORTANT: only do this in one-file mode. In two-file mode the user's
+      // target file IS the explicit mapping intent — surfacing an old saved
+      // template alongside the AI auto-match creates a UX trap where the user
+      // sees the AI mapping apply, then clicks "Apply" on the lingering
+      // template banner thinking it confirms the AI result, and instead
+      // silently clobbers it back to the template's selections. That looks
+      // exactly like the AI mapping "reverted on its own". Skip the whole
+      // template lookup in two-file mode so the banner never appears.
+      if (mode !== 'two-file') {
+        const headerRow = matrix[detected] || [];
+        const colNames = headerRow.map(h => String(h || '').trim());
+        const signature = hashColumnSignature(colNames);
+        const currentTemplates = await loadTemplates();
+        const match = currentTemplates.find(t => t.signature === signature);
+        if (match) setMatchedTemplate(match);
+      }
 
       // Two-file mode: if a format file is already loaded, run the AI match now
       if (mode === 'two-file' && targetColumns.length > 0 && built) {
