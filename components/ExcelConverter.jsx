@@ -863,6 +863,16 @@ export default function ExcelConverter() {
     const selectedIds = columns.filter(c => c.selected).map(c => c.id);
     if (selectedIds.length === 0) { setError('Tick at least one column first.'); return; }
     if (effectivelySelectedRows.length === 0) { setError('No rows match your filters and selections.'); return; }
+    // Belt-and-suspenders: if the user somehow navigates to Preview while an
+    // AI match is still in flight (the Next button is disabled during
+    // mappingLoading, but keyboard activation or edge cases could still get
+    // past it), invalidate the in-flight request so its late response doesn't
+    // silently rewrite columns after the user clicks Back. The user has
+    // explicitly committed to whatever state they see right now.
+    if (mappingLoading) {
+      matchRequestIdRef.current += 1;
+      setMappingLoading(false);
+    }
     // Preserve the existing outputOrder (which may have been set by AI auto-match
     // to follow the target file's column order). Only append IDs that genuinely
     // don't appear in outputOrder yet (which should never happen since the
@@ -1426,6 +1436,14 @@ Return only the JSON array.`;
               </div>
             )}
 
+            {mappingLoading && (
+              <div style={{ padding: '10px 20px', background: BRAND.cyanLight, borderBottom: `0.5px solid ${BRAND.cyan}`, color: BRAND.cyan, fontSize: '12px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Sparkles size={14} />
+                <span>Claude is matching your columns against the target format…</span>
+                <span style={{ color: BRAND.grayDark, fontWeight: 400, marginLeft: 'auto' }}>Usually 3–10 seconds · Next is disabled until matching finishes</span>
+              </div>
+            )}
+
             {(sheetNames.length > 1 || rawSheetData.length > 0) && (
               <div style={{ padding: '10px 20px', borderBottom: `0.5px solid ${BRAND.grayLight}`, background: BRAND.surface, display: 'flex', alignItems: 'center', gap: '20px', flexWrap: 'wrap', fontSize: '12px' }}>
                 {sheetNames.length > 1 && (
@@ -1546,17 +1564,19 @@ Return only the JSON array.`;
                 </button>
                 <button
                   onClick={goToPreview}
-                  disabled={selectedColCount === 0 || effectivelySelectedRows.length === 0}
+                  disabled={selectedColCount === 0 || effectivelySelectedRows.length === 0 || mappingLoading}
                   title={
-                    selectedColCount === 0
-                      ? 'Tick at least one column to continue'
-                      : effectivelySelectedRows.length === 0
-                        ? 'No rows match — adjust or clear your filter rules'
-                        : ''
+                    mappingLoading
+                      ? 'Wait for Claude to finish matching columns…'
+                      : selectedColCount === 0
+                        ? 'Tick at least one column to continue'
+                        : effectivelySelectedRows.length === 0
+                          ? 'No rows match — adjust or clear your filter rules'
+                          : ''
                   }
-                  style={{ background: BRAND.cyan, color: 'white', border: 'none', padding: '7px 14px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (selectedColCount === 0 || effectivelySelectedRows.length === 0) ? 0.5 : 1 }}
+                  style={{ background: BRAND.cyan, color: 'white', border: 'none', padding: '7px 14px', borderRadius: '6px', fontSize: '12px', fontWeight: 500, cursor: (selectedColCount === 0 || effectivelySelectedRows.length === 0 || mappingLoading) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: (selectedColCount === 0 || effectivelySelectedRows.length === 0 || mappingLoading) ? 0.5 : 1 }}
                 >
-                  Next · preview<ArrowRight size={13} />
+                  {mappingLoading ? 'Matching…' : <>Next · preview<ArrowRight size={13} /></>}
                 </button>
               </div>
             </div>
